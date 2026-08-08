@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package peri.display.v1;
+
+import "common.proto";
+
+option java_package = "com.peri.display.proto";
+option java_multiple_files = true;
+option swift_prefix = "Peri";
+
+// =============================================================================
+// 앱 #2 — 화면 공유 (Android → Mac).
+//
+// 확장의 거울상이지만 대칭은 아니다. 시작 버튼은 Mac에 있어도 화면을 실제로 내줄지는
+// **사람이 폰에서** 정한다:
+//
+//     Mac이 아이콘을 누른다 → 폰이 사람에게 묻는다 → 인코더 기동 → 프레임
+//
+// 그래서 확장에 없는 어휘가 하나 있다: **동의**. 그리고 그 동의는 세션보다 수명이 짧다 —
+// Android 14+의 MediaProjection 토큰은 1회용이라, 무손실 재개로 세션이 살아남아도 이 앱은
+// 못 살아난다. `ShareStatus`가 그 사실을 나르는 통로다.
+//
+// 확장만큼 어휘가 적은 이유: 적응 비트레이트도 LTR 복구도 아직 없다. 공유는 짧게 쓰고 끄는
+// 성격이라 손실이 나면 다음 IDR(2초)을 기다리는 게 가장 단순한 복구이고, 그걸로 충분한지는
+// 실기기에서 확인할 문제다.
+// =============================================================================
+
+// Mac → Android: 화면을 내줘 / 그만.
+message ShareRequest {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_START = 1;   // 사람에게 물어서 화면을 내줘
+    ACTION_STOP = 2;    // 그만
+  }
+  Action action = 1;
+}
+
+// Android → Mac: 동의 결과와 중단 통보.
+//
+// 세 갈래뿐인 건 이게 **사람이 누른 결과**이기 때문이다. 협상할 것도, 되물을 것도 없다.
+message ShareStatus {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_GRANTED = 1;   // 사람이 허용했고 인코더가 곧 돈다
+    PHASE_DENIED = 2;    // 거부 / 동의를 받을 수 없음
+    PHASE_STOPPED = 3;   // 돌다가 멈췄다 (사용자 중지, 인코더 오류, 화면 꺼짐)
+  }
+  Phase phase = 1;
+  string reason = 2;
+}
+
+// Android가 보낼 영상의 제원. Mac은 이게 있어야 디코더를 세운다.
+//
+// 협상이 아니라 **통보**다. 확장에서는 Mac이 상대 능력을 보고 정했지만, 여기서는 굽는 쪽이
+// Android이고 무엇을 구울 수 있는지는 그쪽만 안다 — 특히 `codec`은 요청이 아니라 **결과**다
+// (H.265를 못 세운 기기는 스스로 H.264로 내려간다).
+message ShareParams {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 fps = 3;
+  VideoCodec codec = 4;
+  uint32 bitrate_kbps = 5;
+
+  // 기기 화면의 **실제 물리 크기**(마이크로미터). Mac이 창을 실물 크기로 띄우는 근거다.
+  //
+  // 왜 픽셀·DPI로는 안 되는가: 캡처는 다운스케일된다(1080x2340 → 590x1280). 그러면 위의
+  // width/height는 물리 크기와 아무 관계가 없고, DPI를 같이 보내도 그건 **원본** 해상도의
+  // DPI라 수신측이 두 값을 곱하고 나누다 어긋난다. 물리 치수는 스케일에 불변이라 그냥 보낸다.
+  //
+  // µm인 이유: mm 단위 정수면 70mm 폭 폰에서 1.4% 오차가 나고, 실물 크기가 목적인데
+  // 그 정도면 눈에 띈다. 0 = 기기가 물리 크기를 모른다(수신측은 적당한 기본값으로).
+  uint32 physical_width_um = 6;
+  uint32 physical_height_um = 7;
+}

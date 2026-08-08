@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package peri.display.v1;
+
+// common.proto는 직접 import하지 않는다 — 봉투는 앱 메시지만 담고 열거형을 직접 쓰지 않는다.
+// (넣으면 protoc가 미사용 import로 경고한다.)
+import "session.proto";
+import "extend.proto";
+import "share.proto";
+import "notify.proto";
+
+option java_package = "com.peri.display.proto";
+option java_multiple_files = true;
+option swift_prefix = "Peri";
+
+// =============================================================================
+// Peri Display — 제어 채널 봉투 (v0.1)
+//
+// framing: [4B length][1B type][12B nonce][AES-GCM(ControlMessage)][16B tag]
+//
+// 영상 데이터 경로는 여기 없다. per-fragment 오버헤드를 피하려고 protobuf가 아닌 커스텀
+// 12B/16B 바이너리 헤더를 쓴다 (DESIGN.md §2).
+//
+// ★ **이 파일은 사라질 예정이다.**
+//
+// 봉투가 모든 앱의 메시지를 알아야 하는 건 와이어 v1에 `service_id`가 없기 때문이다.
+// 그래서 지금은 앱을 하나 더하면 여기 oneof에 줄이 늘고, 수신측은 등록부가 **전부에게**
+// 뿌린 뒤 각자 자기 것만 골라 간다. 앱이 둘일 땐 비용이 없지만 원칙 2("새 서비스 = 파일
+// 추가 + 등록 한 줄, 세션/먹스는 0줄")를 프로토콜 층에서는 아직 못 지킨다는 뜻이다.
+//
+// Mux(와이어 v2)가 들어오면 조각 헤더의 1바이트 `service_id`가 이 oneof를 대체한다:
+// 세션은 "이 조각은 2번 앱 것"까지만 알고 내용은 열지 않으며, 각 앱이 자기 .proto만
+// 파싱한다. 그때 이 파일은 지워지고 `common/session/extend/share`만 남는다.
+//
+// 파일이 넷으로 갈린 순서에도 의미가 있다:
+//   common.proto  — 둘 이상의 계층이 쓰는 어휘
+//   session.proto — 어느 앱이 떠 있든 의미가 같은 것 (신원·생존·앱 수명)
+//   extend.proto  — 앱 #1의 어휘
+//   share.proto   — 앱 #2의 어휘
+// =============================================================================
+
+message ControlMessage {
+  oneof payload {
+    // ── 세션 ────────────────────────────────────────────────────────────
+    // PQ-STS 3-pass. 1·2는 평문 프레임이고, 신원(인증서+서명)은 그 안에서 봉인된다.
+    StsHello    sts_hello = 1;         // Pass 1  Android → Mac
+    StsResponse sts_response = 2;      // Pass 2  Mac → Android
+    StsConfirm  sts_confirm = 11;      // Pass 3  Android → Mac
+    Ping ping = 8;
+    Pong pong = 9;
+    Bye bye = 14;                      // 기기가 떠난다는 명시적 선언 (→ Mac이 가상 디스플레이 정리)
+    // 앱 수명 — 세션이 붙었다고 앱이 뜨지는 않는다. 사용자가 아이콘을 눌러야 뜬다.
+    AppControl app_control = 15;       // Mac → Android: 이 앱을 띄워라 / 내려라
+    AppState   app_state = 16;         // Android → Mac: 그 앱이 지금 이렇다
+    // 데이터그램(UDP) 채널 수명 — 세션이 아니라 **영상을 쓰는 앱**의 수명을 따른다.
+    UdpOpen   udp_open = 25;           // Mac → Android: 이 세대를 연다 (채널 id + 후보)
+    UdpAccept udp_accept = 26;         // Android → Mac: 후보 회신
+    UdpClose  udp_close = 27;          // 양방향: 이 세대를 닫는다
+
+    // ── 앱 #1 · 화면 확장 ───────────────────────────────────────────────
+    SessionParams session_params = 3;
+    Renegotiate   renegotiate = 4;
+    KeyframeRequest   keyframe_request = 5;
+    TransportFeedback transport_feedback = 6;
+    DisplayConfig     display_config = 7;
+    LtrAck ltr_ack = 10;
+    PlayoutConfig playout_config = 12; // 재생(고정 지터) 버퍼 깊이 설정 (Mac UI 라이브 조절)
+
+    // ── 앱 #2 · 화면 공유 ───────────────────────────────────────────────
+    ShareRequest share_request = 17;   // Mac → Android: 화면을 내줘 / 그만
+    ShareStatus  share_state = 18;     // Android → Mac: 동의됨 / 거부됨 / 중단됨
+    ShareParams  share_params = 19;    // Android → Mac: 보낼 영상의 크기·코덱
+
+    // ── 앱 #4 · 알림 ────────────────────────────────────────────────────
+    NotificationPosted  notification_posted = 20;    // Android → Mac
+    NotificationRemoved notification_removed = 21;   // Android → Mac
+    NotificationAction  notification_action = 22;    // Mac → Android: 열기/지우기/답장
+    NotificationSync    notification_sync = 23;      // Mac → Android: 지금 것 전부 다시
+    NotificationActionFailed notification_action_failed = 24;  // Android → Mac: 조작 실패
+  }
+  // 13 = LanEndpoint (제거됨). Mac의 LAN 접속점(ip:port)을 AOA 채널로 밀어 넣어 USB 분리 시
+  // 폴백 주소로 쓰던 것. ICE 도입으로 폐기했다 — 시그널링은 BLE 하나로 통합되고, USB 분리도
+  // '전송이 무효해졌다'는 같은 사건이라 망 전환과 동일하게 후보 재교환으로 복구한다.
+  // 옛 방식은 같은 LAN에서만 동작했고(분리 후 LTE면 무용), 주소 스냅샷이라 낡았으며,
+  // 포트가 유동이 된 뒤로는 더 취약해졌다.
+  reserved 13;
+}

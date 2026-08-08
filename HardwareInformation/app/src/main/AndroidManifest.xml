@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Capability queries only — all three are install-time "normal" permissions, so nothing here
+      ever prompts the user. Even "is 5 GHz supported" goes through WifiService, which rejects any
+      caller without ACCESS_WIFI_STATE. Legacy BLUETOOTH is only enforced up to Android 11; from 12
+      the adapter's capability getters need no permission at all.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NFC" />
+    <!--
+      Without this, Android 12+ caps what getMinDelay() reports to 200 Hz, so a 480 Hz gyroscope
+      reads as 5,000 µs instead of its real 2,084 µs — the app would be describing its own quota
+      rather than the hardware. Normal protection level, so it is granted at install with no prompt.
+    -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+
+    <!--
+      Not a permission and not a widening of one: from Android 11 an app cannot see other packages
+      unless it says which kind it is looking for, and without this the feedback intent resolves to
+      nothing and throws even on a device with three mail apps installed. It grants the ability to
+      see that mail apps exist, nothing more — no reading, no launching anything else.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HardwareInformation">
+
+        <!--
+          No screenOrientation and no configChanges: the activity must be free to resize so
+          foldables and desktop windowing work, and all state lives in the ViewModel so a
+          configuration change costs nothing.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          The export is shared as a file rather than an intent extra: a full dump runs to tens of
+          thousands of characters and EXTRA_TEXT has to cross a Binder transaction.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+
+</manifest>

@@ -1,0 +1,291 @@
+syntax = "proto3";
+
+package peri.display.v1;
+
+option java_package = "com.peri.display.proto";
+option java_multiple_files = true;
+option swift_prefix = "Peri";
+
+// =============================================================================
+// 앱 #4 — 알림 (Android → Mac).
+//
+// **화면 공유와 무엇이 다른가**: 공유는 알림을 *그림*으로 나른다. 읽을 수만 있고 누를 수도,
+// 답할 수도, 지울 수도 없으며, 배너가 사라지면 같이 사라진다. 여기서는 알림이 **데이터**로
+// 와서 Mac의 진짜 알림이 된다 — 눌러서 폰의 그 앱을 열고, 폰에서 지우고, 답장까지 한다.
+//
+// 그래서 화면 공유와 **독립적이다.** 케이블도 필요 없고(HID와 다르다), 공유를 안 켜도 돈다.
+//
+// 축은 `key`(StatusBarNotification.getKey()) 하나다. 같은 알림의 갱신·취소·조작이 전부
+// 이 값으로 묶인다 — 패키지+id로 직접 조합하면 사용자·그룹 구분을 놓쳐 엉뚱한 걸 지운다.
+//
+// ★ 이 프로토콜의 규칙: **기기는 받아쓰고, Mac이 해석한다.**
+// ─────────────────────────────────────────────────────────
+// 처음에는 기기가 정제해서 보냈다. 스타일을 골라 한 줄 목록으로 펴고, 빈 텍스트를 "[사진]"
+// 으로 메우고, 그림 셋 중 하나를 고르고, 볼 것 없는 알림을 걸렀다. 그러면 Mac은 **이미
+// 내려진 판단**만 받으므로, 표시를 바꾸려면 매번 기기 코드를 고치고 프로토콜을 늘려야 했다.
+// 실제로 대화 제목·발신자 사진·방 아이콘이 그 순서로 하나씩 뒤늦게 붙었다.
+//
+// 그래서 방향을 뒤집었다. 기기는 자기만 아는 **사실**을 최대한 싣고(어느 스타일인지, 원본
+// 텍스트 칸이 각각 뭐였는지, 그림이 몇 장인지, 액션이 뭐가 있는지), 무엇을 어떻게 보여줄지는
+// 전부 Mac이 정한다. 거르는 것도 Mac이 한다 — 기기가 걸러 버리면 Mac은 그런 알림이 있었다는
+// 사실조차 모른다.
+//
+// 판단이 아닌 것만 기기가 한다: **읽을 수 없는 것**(다른 앱의 ContentProvider), **크기
+// 상한**(메시지 25개, 사람 8명), **PNG로의 변환**(Drawable은 와이어에 못 싣는다).
+// =============================================================================
+
+// Android → Mac: 알림이 떴다(또는 내용이 갱신됐다).
+//
+// 갱신도 같은 메시지로 온다 — Android가 같은 key로 다시 post하는 게 곧 갱신이라,
+// 따로 만들면 두 경로가 어긋난다. 수신측은 key로 덮어쓴다.
+message NotificationPosted {
+  // ── 신원 ────────────────────────────────────────────────────────────────
+  string key = 1;
+  string package_name = 2;
+  string app_label = 3;              // 사람이 읽는 앱 이름 ("메시지")
+
+  // ── 시각 ────────────────────────────────────────────────────────────────
+  // 시스템이 이 알림을 받은 때. 갱신되면 앱이 지정하지 않는 한 그대로다.
+  int64 posted_at_millis = 4;
+  // 앱이 "이 알림이 가리키는 사건이 일어난 때"라고 밝힌 값(`Notification.when`).
+  // 메신저는 메시지가 온 시각을 넣는다. 0이면 안 넣은 것이다.
+  int64 when_millis = 5;
+
+  // ── 기기만 아는 사실들 ──────────────────────────────────────────────────
+  // 진행 중 알림(음악 재생·내비). 배너로 띄울지는 받는 쪽이 정한다.
+  bool ongoing = 6;
+  // 사용자가 스와이프로 지울 수 있는가. 아니면 '지우기'를 내줘 봐야 안 지워진다.
+  bool clearable = 7;
+  // 묶음의 **머리**인가(`FLAG_GROUP_SUMMARY`). 폰의 그늘에서는 접힌 묶음의 제목 줄이
+  // 되지만 그 자체로는 대개 내용이 없다. 거를지는 받는 쪽이 정한다.
+  bool group_summary = 8;
+  // **우리가 띄운 알림인가.** 이 앱이 폰에 띄우는 건 전부 Mac을 위한 뒷일이다(잠금 해제
+  // 요청, 공유 중 표시, 공유 동의). 그대로 되돌리면 Mac이 시킨 일이 Mac에게 알림으로
+  // 돌아온다 — 실기기에서 "Mac에서 알림을 열려고 합니다"가 Mac에 떴다.
+  //
+  // 패키지 이름을 받는 쪽이 비교하게 하지 않는 이유: 그러면 Mac 코드에 안드로이드 앱의
+  // 패키지 이름이 상수로 박힌다. 어느 쪽이 나인지는 기기가 확실히 안다.
+  bool from_peri = 9;
+  // 시스템이 대화형으로 분류했는가(`Ranking.isConversation()`). Android 11+의 대화
+  // 섹션에 들어가는 기준이고, `MessagingStyle` 유무보다 넓다.
+  bool is_conversation = 10;
+  // 채널 중요도(`Ranking.getImportance()`, `NotificationManager.IMPORTANCE_*`).
+  // 소리를 낼지 조용히 쌓을지의 근거가 된다.
+  int32 importance = 11;
+  // `Notification.category` — "msg"/"call"/"alarm"/"progress" 등. 앱이 스스로 밝힌 종류다.
+  string category = 12;
+  string channel_id = 13;
+
+  // 앱이 붙인 묶음 이름(`Notification.getGroup()`) — **가공하지 않은 원본**.
+  //
+  // 앱이 자기 안에서만 유일하게 짓는 값이라, 두 앱이 나란히 "chat"을 쓸 수 있다. 받는
+  // 쪽에서 패키지 이름·기기 지문과 함께 엮어야 안전하다. 그 엮는 방식이 macOS의
+  // `threadIdentifier` 정책이므로 여기서 미리 정하지 않는다.
+  //
+  // `StatusBarNotification.getGroupKey()`는 **일부러 안 쓴다.** 그건 그룹이 없을 때
+  // 알림마다 다른 값(`…|id|tag|uid`)이 되어서, 묶으라고 넣은 값이 정반대로 동작한다.
+  string group = 14;
+  string sort_key = 15;
+  // 앱이 지정한 강조색(ARGB). 0이면 안 지정한 것이다.
+  int32 color = 16;
+
+  // ── 원본 텍스트·스타일·그림·액션 ────────────────────────────────────────
+  NotificationText text = 17;
+  NotificationStyle style = 18;
+  NotificationImages images = 19;
+
+  // 알림에 달린 버튼 전부. 답장뿐 아니라 '보관'·'읽음 표시'까지 그대로 온다.
+  //
+  // 예전에는 답장 가능한 첫 액션의 번호만 실었다. 그건 "답장 말고는 안 쓴다"는 판단이
+  // 프로토콜에 박힌 것이라, 나중에 다른 버튼을 쓰려면 프로토콜부터 고쳐야 했다.
+  repeated NotificationActionInfo actions = 20;
+}
+
+// `extras`에 들어 있던 텍스트 칸들 — **합치지 않고 각각 그대로.**
+//
+// 예전에는 `text`가 비면 `big_text`로 물러서서 한 칸에 담아 보냈다. 그러면 받는 쪽은
+// 원래 어느 칸이었는지 알 수 없고, "짧은 본문과 펼친 본문을 다르게 쓰겠다"는 선택지가
+// 프로토콜 단계에서 이미 사라진다.
+message NotificationText {
+  string title = 1;         // EXTRA_TITLE
+  string title_big = 2;     // EXTRA_TITLE_BIG — 펼쳤을 때의 제목
+  string text = 3;          // EXTRA_TEXT — 접혔을 때의 한 줄
+  string big_text = 4;      // EXTRA_BIG_TEXT — BigTextStyle의 전문
+  string sub_text = 5;      // EXTRA_SUB_TEXT — 헤더의 부제
+  string summary_text = 6;  // EXTRA_SUMMARY_TEXT — 스타일의 요약 줄
+  string info_text = 7;     // EXTRA_INFO_TEXT — 오른쪽 끝의 짧은 글
+}
+
+// 어떤 틀로 만들어진 알림인가.
+message NotificationStyle {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;   // 스타일 없음 — 제목 한 줄 + 본문 한 줄
+    KIND_BIG_TEXT = 1;
+    KIND_BIG_PICTURE = 2;
+    KIND_INBOX = 3;
+    KIND_MESSAGING = 4;
+    KIND_MEDIA = 5;
+    KIND_CALL = 6;
+    KIND_DECORATED = 7;     // 앱이 직접 그린 뷰를 감싼 것
+    KIND_OTHER = 8;         // 우리가 모르는 스타일 — template_class를 보라
+  }
+  Kind kind = 1;
+  // `EXTRA_TEMPLATE`의 원본 문자열("android.app.Notification$MessagingStyle").
+  // 우리가 모르는 스타일이 와도 사실은 그대로 넘어간다.
+  string template_class = 2;
+
+  MessagingStyle messaging = 3;   // kind == KIND_MESSAGING
+  InboxStyle inbox = 4;           // kind == KIND_INBOX
+}
+
+// 대화형 알림(`MessagingStyle`)의 원본.
+//
+// 왜 이게 따로 필요한가: 카카오톡처럼 같은 방에 여러 개가 쌓이면 `text`에는 **마지막
+// 하나만** 담긴다. 폰에서 알림을 펼치면 6개가 다 보이는데 Mac에는 하나만 보이던 게 그
+// 때문이다. 원본 목록이 있어야 받는 쪽이 무엇을 어떻게 보여줄지 고를 수 있다.
+message MessagingStyle {
+  // 대화방 이름. 단톡방에서 **사용자가 찾는 축이 이것이다.** `title`에는 앱이 원하는 아무
+  // 문구나 들어가고(카카오톡은 마지막 발신자를 넣는다), 방 이름은 여기에만 있다.
+  //
+  // 1:1 대화에서는 보통 비어 있다 — 안드로이드가 이 필드의 유무를 "그룹인가"의 힌트로
+  // 쓰기 때문에 앱들이 일부러 안 채운다.
+  string conversation_title = 1;
+  bool group_conversation = 2;
+  // '나'의 표시 이름(`getUser().getName()`). 비어 있을 수 있다 — 그때 뭐라고 부를지는
+  // 받는 쪽이 정한다.
+  string user_name = 3;
+
+  repeated MessagingMessage messages = 4;
+  // 이 알림 이전의 대화(`getHistoricMessages()`). 앱이 문맥으로 딸려 보내는 것이라
+  // 대개 이미 읽은 것들이다 — 보여줄지 말지가 갈리므로 따로 담는다.
+  repeated MessagingMessage historic = 5;
+
+  // 이 대화에 등장한 사람들. **줄마다가 아니라 사람마다 하나씩** 보낸다 — 한 사람이
+  // 연달아 열 마디를 하면 줄마다 붙일 경우 같은 사진이 열 번 나간다.
+  // 줄은 `sender_key`(없으면 `sender`)로 이 목록을 가리킨다.
+  repeated NotificationPerson people = 6;
+}
+
+// 대화의 메시지 한 줄.
+message MessagingMessage {
+  // 앱이 넣은 그대로. **사진만 보낸 메시지는 비어 있다** — 채우지 않는다.
+  // "[사진]" 같은 대체 문구를 넣을지, 넣는다면 뭐라고 할지는 받는 쪽의 몫이다.
+  string text = 1;
+  int64 timestamp_millis = 2;
+
+  // 보낸 사람. 내가 보낸 메시지면 **비어 있다**(원본은 `person`이 null인 것으로 '나'를
+  // 표시한다 — 그게 문서의 계약이다). 그 자리를 무엇으로 메울지는 받는 쪽이 정한다.
+  string sender = 3;
+  string sender_key = 4;    // Person.getKey() — 이름이 같은 두 사람을 가른다
+  bool from_me = 5;
+
+  // 사진·동영상·음성 메시지의 종류("image/jpeg"). 비었으면 글 메시지다.
+  string data_mime_type = 6;
+  // 그 내용의 위치. **우리는 못 읽는다** — 그 앱의 ContentProvider 권한이 필요하고,
+  // 그건 알림 전달의 범위를 넘는다. 있다는 사실만 전한다.
+  string data_uri = 7;
+}
+
+// 여러 줄짜리 알림(`InboxStyle`). 메일 묶음이 이 모양을 쓴다.
+message InboxStyle {
+  repeated string lines = 1;
+}
+
+// 대화 참여자 한 명.
+message NotificationPerson {
+  string name = 1;
+  string key = 2;        // 이름이 같은 두 사람을 가르는 값. 없을 수 있다
+  bool bot = 3;
+  bool important = 4;
+  bytes icon_png = 5;    // 96px 정사각 PNG. 없으면 비어 있다
+}
+
+// 알림에 담긴 그림들 — **고르지 않고 있는 대로 전부.**
+//
+// 어느 걸 쓸지는 받는 쪽이 정한다. 예전에는 기기가 "대화 아이콘"이라는 이름으로 한 장만
+// 골라 보냈는데, 그건 이미 내려진 판단이라 Mac에서 다르게 쓰고 싶어도 원본이 없었다.
+//
+// 매번 싣는다. 알림은 초당 수십 개씩 오지 않으므로, 캐시 무효화를 관리하는 복잡도가
+// 아끼는 대역폭보다 비싸다.
+//
+// 크기가 둘로 갈리는 건 **쓰이는 자리가 달라서**다: 아이콘은 모서리의 작은 배지로 얹히고,
+// 사진은 그림 자리를 통째로 차지한다.
+message NotificationImages {
+  // 앱 아이콘(패키지 매니저). 색이 있는 진짜 아이콘이다. 64px.
+  bytes app_icon_png = 1;
+  // 알림 자신의 작은 아이콘. 색이 빠진 실루엣이지만 **패키지 가시성과 무관하게** 읽힌다 —
+  // 시스템이 알림과 함께 넘겨 주기 때문이다. 앱 아이콘을 못 읽을 때의 최후 수단. 64px.
+  bytes small_icon_png = 2;
+  // 알림의 큰 아이콘(`getLargeIcon()`). 메신저는 관례적으로 여기에 **방 아이콘 또는 1:1
+  // 상대의 사진**을 넣는다 — 참여자 사진(`people`)과는 다른 값이다. 96px.
+  bytes large_icon_png = 3;
+}
+
+// 알림에 달린 버튼 하나.
+message NotificationActionInfo {
+  // 이 알림의 액션 배열에서의 자리. 지시를 되돌릴 때 이 번호를 쓴다.
+  uint32 index = 1;
+  string title = 2;
+  // `RemoteInput`이 달려 있는가 — **있으면 답장할 수 있다.**
+  bool has_remote_input = 3;
+  // 그 입력란의 안내 문구("메시지 보내기"). 없을 수 있다.
+  string remote_input_label = 4;
+  // 시스템이 아는 뜻(`SEMANTIC_ACTION_*`): 1=답장, 2=읽음, 4=삭제, 5=보관 …
+  // 0이면 앱이 안 밝힌 것이라 `title`로만 판단할 수 있다.
+  uint32 semantic_action = 5;
+  // 문맥 액션(`isContextual()`) — 시스템이 내용을 보고 만들어 붙인 제안이다.
+  bool contextual = 6;
+}
+
+// Android → Mac: 알림이 사라졌다(사용자가 지웠거나 앱이 취소했다).
+message NotificationRemoved {
+  string key = 1;
+}
+
+// Mac → Android: 이 알림에 무엇을 해라.
+message NotificationAction {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_OPEN = 1;      // contentIntent 실행 — 폰에서 그 앱이 열린다
+    KIND_DISMISS = 2;   // 폰에서 지운다
+    KIND_REPLY = 3;     // action_index의 RemoteInput에 text를 실어 보낸다
+  }
+  string key = 1;
+  Kind kind = 2;
+  string text = 3;      // KIND_REPLY 전용
+
+  // 쏠 액션의 **번호 + 1** (0 = 기기가 알아서 고른다).
+  //
+  // +1인 이유: proto3의 uint32는 기본값 0을 "없음"과 구분하지 못하는데, 액션 번호 0은
+  // 유효한 값이다. 한 칸 밀어 두면 0 하나로 "미지정"을 표현할 수 있다.
+  //
+  // 0을 남겨 둔 이유: 보내고 받는 사이에 앱이 알림을 갱신해 액션 순서가 바뀌었을 수 있다.
+  // 그때는 기기가 지금 떠 있는 알림에서 다시 찾는 편이 언제나 맞다.
+  uint32 action_index = 4;
+}
+
+// Android → Mac: 조작이 안 됐다.
+//
+// **실패만 보낸다.** 성공은 알림이 사라지는 것으로 이미 드러나므로 따로 알릴 게 없다.
+// 이게 없으면 Mac에서는 "눌렀는데 아무 일도 안 일어남"으로만 보이고, 그게 가장 고치기 어려운
+// 종류의 실패다.
+message NotificationActionFailed {
+  string key = 1;
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // 기기가 잠겨 있다. 기기가 잠금 해제를 청하는 알림을 띄웠으므로, 폰을 풀면 열린다.
+    REASON_LOCKED = 1;
+    // '다른 앱 위에 표시'가 꺼져 있다 — 그게 없으면 시스템이 앱 실행을 막는다.
+    REASON_NOT_PERMITTED = 2;
+    // 그 알림이 기기에서 이미 사라졌다.
+    REASON_GONE = 3;
+  }
+  Reason reason = 2;
+  string detail = 3;   // 사람이 읽는 한 줄
+}
+
+// Mac → Android: 지금 떠 있는 알림을 전부 다시 보내라.
+//
+// 앱이 뜰 때 한 번 보낸다. 이게 없으면 Mac은 **앱을 켠 뒤에 온 알림만** 알게 되고,
+// 이미 쌓여 있던 것들은 영영 안 보인다.
+message NotificationSync {}

@@ -1,0 +1,43 @@
+<resources>
+    <string name="app_name">Hardware Information</string>
+
+    <!--
+      UI chrome only. Hardware field names ("Manufacturer", "Supported ABIs", "Kernel") are
+      deliberately hardcoded in the collectors: they are the names the platform itself uses, and
+      translating them would make them harder to match against Android docs and adb output.
+    -->
+    <string name="detail_empty">Select a category</string>
+    <string name="action_back">Back</string>
+    <string name="action_expand">Expand</string>
+    <string name="action_collapse">Collapse</string>
+    <string name="action_show_more">Show more</string>
+    <string name="action_show_less">Show less</string>
+    <string name="copied">Copied</string>
+
+    <string name="about_title">About</string>
+    <!-- The one place the feedback address is written down. -->
+    <string name="feedback_email" translatable="false">gisunju@gmail.com</string>
+    <string name="feedback_subject" translatable="false">Hardware Information feedback</string>
+    <string name="feedback_send">Send feedback</string>
+    <string name="feedback_send_with_inventory">Attach the full inventory</string>
+    <string name="feedback_no_email_app">No email app is available to send this</string>
+    <string name="about_tagline">Every piece of hardware this device will admit to, read on-device and never sent anywhere.</string>
+
+    <string name="action_close_search">Close search</string>
+    <string name="action_export">Export</string>
+    <string name="action_raw_values">Raw values</string>
+    <string name="search_hint">Search all hardware</string>
+    <string name="search_hint_body">Search across every category.</string>
+    <string name="search_indexing">Reading every category… %1$d of %2$d</string>
+    <string name="search_no_results">Nothing matches “%1$s”.</string>
+    <string name="export_share_title">Share hardware information</string>
+    <string name="export_failed">Could not build the export</string>
+
+    <string name="value_yes">Yes</string>
+    <string name="value_no">No</string>
+
+    <string name="unavailable_needs_permission">Requires permission</string>
+    <string name="unavailable_os_restricted">Restricted by Android</string>
+    <string name="unavailable_not_supported">Not supported</string>
+    <string name="unavailable_read_failed">Could not be read</string>
+</resources>

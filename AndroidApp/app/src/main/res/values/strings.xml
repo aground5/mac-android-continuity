@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">Peri Display</string>
+
+    <!-- 화면 공유(앱 #2) -->
+    <string name="share_channel_active">화면 공유 중</string>
+    <string name="share_channel_consent">화면 공유 요청</string>
+    <string name="share_active_title">화면을 공유하고 있습니다</string>
+    <string name="share_active_text">Mac에서 이 기기의 화면을 보고 있습니다</string>
+    <string name="share_stop">중지</string>
+    <string name="share_consent_title">Mac이 화면 공유를 요청했습니다</string>
+    <string name="share_consent_text">눌러서 허용하거나 거부하세요</string>
+
+    <!-- 알림(앱 #4) -->
+    <string name="notify_service_label">Peri Display 알림 전달</string>
+    <string name="notify_unlock_channel">잠금 해제 요청</string>
+    <string name="notify_unlock_title">Mac에서 알림을 열려고 합니다</string>
+    <!-- 전체 화면 알림이 허용된 경우: 화면이 저절로 켜지고 잠금 해제 화면이 뜬다.
+         알림은 그늘에만 남으므로 "누르라"고 하면 거짓말이 된다. -->
+    <string name="notify_unlock_text">잠금을 해제하면 열립니다</string>
+    <string name="notify_unlock_text_app">%1$s — 잠금을 해제하면 열립니다</string>
+    <!-- 허용되지 않은 경우: 알림이 유일한 통로다. 이때만 "누르라"고 한다. -->
+    <string name="notify_unlock_text_tap">눌러서 잠금을 해제하면 열립니다</string>
+    <string name="notify_unlock_text_tap_app">%1$s — 눌러서 잠금을 해제하면 열립니다</string>
+</resources>

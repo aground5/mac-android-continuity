@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+package peri.display.v1;
+
+import "common.proto";
+
+option java_package = "com.peri.display.proto";
+option java_multiple_files = true;
+option swift_prefix = "Peri";
+
+// =============================================================================
+// 앱 #1 — 화면 확장 (Mac → Android).
+//
+// Mac 화면을 기기로 넓힌다. 여기 있는 전부가 **한 방향 스트림 하나**의 사정이다:
+// 무엇을 어떤 크기로 굽고, 손실을 어떻게 복구하고, 수신측이 얼마나 버퍼링할지.
+//
+// 세션은 이 파일의 내용을 하나도 모른다. `ControlMessage`가 아직 이 메시지들을 알고 있는
+// 건 와이어 v1에 service_id가 없어서이고, 그건 봉투의 사정이지 세션의 사정이 아니다.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 수신측 능력 — 협상의 원재료
+// -----------------------------------------------------------------------------
+
+// 수신측(Android) 디스플레이/창 특성. Mac은 이 값으로 가상 디스플레이 해상도/DPI/주사율을
+// 정하고 인코더를 맞춘다. width/height는 *현재 앱 창이 차지하는 영역*(전체화면=전체, 분할/팝업=창)
+// 이고, max_*는 전체 디스플레이(가상 디스플레이 framebuffer 상한 결정용).
+message DisplayCaps {
+  uint32 width_px = 1;                 // 현재 앱 창 가로 (전체화면이면 전체 디스플레이)
+  uint32 height_px = 2;                // 현재 앱 창 세로
+  uint32 density_dpi = 3;              // densityDpi (예: 420). 물리크기/hiDPI 결정
+  float  refresh_rate = 4;             // 주사율 Hz (예: 60, 120)
+  Orientation orientation = 5;         // 현재 방향
+  uint32 max_width_px = 6;             // 전체 디스플레이 가로 (분할/팝업 시 width_px ≤ 이 값)
+  uint32 max_height_px = 7;            // 전체 디스플레이 세로 (가상 디스플레이 max framebuffer 결정)
+  // **화면이 표시할 수 있는** 다이내믹 레인지, 선호순 (Display.HdrCapabilities 그대로).
+  // 디코더 능력과 곱하지 않은 원재료다 — 곱셈은 Mac이 한다(DecoderCaps 참조).
+  // 비어 있으면 SDR로 간주(구버전 클라).
+  repeated DynamicRange supported_dynamic_ranges = 8;
+}
+
+// 수신측 **디코더**의 실제 한계.
+//
+// DisplayCaps와 반드시 분리해야 한다 — "화면이 2340x1080@120을 보여줄 수 있다"와
+// "디코더가 그 조합을 실시간으로 풀 수 있다"는 완전히 다른 사실이고, 어긋나면 프레임 드롭으로
+// 나타난다. 예전엔 클라가 이 둘을 자기 안에서 곱해 불리언 하나로 넘겼는데, 그러면 Mac이
+// 원재료를 못 봐서 "왜 못 하는지"를 구분할 수 없었다.
+message DecoderCaps {
+  VideoCodec codec = 1;
+  // false면 소프트웨어 디코딩이다 — 고해상도·고fps에서 무너지므로 Mac이 보수적으로 잡는다.
+  bool hardware_accelerated = 2;
+  uint32 max_width = 3;
+  uint32 max_height = 4;
+  // **기기 자체 화면 해상도 기준** 달성 가능 fps. Mac이 다운스케일하면 여유는 늘어날 뿐이라
+  // 이 값을 상한으로 쓰는 게 항상 안전하다(해상도별 fps를 전부 실어 보낼 필요가 없다).
+  uint32 max_frame_rate = 5;
+  uint32 max_bitrate_kbps = 6;
+  // 이 디코더가 **풀 수 있는** 다이내믹 레인지 (프로파일 기반. Main10 있으면 HDR10).
+  // 화면 능력(DisplayCaps)과 교집합을 내는 건 Mac의 몫이다.
+  repeated DynamicRange dynamic_ranges = 7;
+  uint32 max_instances = 8;
+}
+
+// -----------------------------------------------------------------------------
+// 협상
+// -----------------------------------------------------------------------------
+
+// Mac → Android: 최종 세션 파라미터 확정
+message SessionParams {
+  VideoCodec  codec = 1;
+  uint32      width = 2;               // 인코딩 해상도
+  uint32      height = 3;
+  uint32      fps = 4;
+  uint32      initial_bitrate_kbps = 5;
+  Orientation orientation = 6;
+  uint32      keyframe_interval_ms = 7;  // 기본 GOP 길이
+  // 확정된 다이내믹 레인지. Mac이 *실제로* HDR 파이프라인을 세우는 데 성공했을 때만 HDR이다
+  // (가상 디스플레이가 EDR 헤드룸을 못 받으면 SDR로 내려간다) → 클라는 이 값만 믿으면 된다.
+  DynamicRange dynamic_range = 8;
+  // HDR 정적 메타데이터 — CTA-861.3 Static Metadata Descriptor(디스크립터 ID 포함 25B) 원본.
+  //
+  // **왜 제어 채널로 보내는가**: VideoToolbox는 이 정보를 CMFormatDescription에만 달고
+  // Annex-B 비트스트림에 SEI로 넣지 않는다(실측 확인 — 키프레임에 PREFIX_SEI NAL이 없다).
+  // 우리는 컨테이너 없이 NAL만 보내므로 그냥 두면 통째로 사라진다.
+  //
+  // 형식은 Android MediaFormat.KEY_HDR_STATIC_INFO가 기대하는 바이트열 그대로다 →
+  // 클라는 해석 없이 그대로 넘기면 된다. dynamic_range가 SDR이면 비어 있다.
+  bytes hdr_static_info = 9;
+}
+
+// 큰 변화 시 재협상 요청 (양방향)
+message Renegotiate {
+  optional VideoCodec  codec = 1;
+  optional uint32      width = 2;
+  optional uint32      height = 3;
+  optional uint32      fps = 4;
+  optional Orientation orientation = 5;
+  string reason = 6;                   // 디버그/로그용
+}
+
+// 디스플레이 구성 변경 (방향/해상도 등 알림)
+message DisplayConfig {
+  uint32      width = 1;
+  uint32      height = 2;
+  Orientation orientation = 3;
+  float       density_dpi = 4;
+}
+
+// -----------------------------------------------------------------------------
+// 스트리밍 중 제어
+// -----------------------------------------------------------------------------
+
+// Android → Mac: 손실/복구 시 refresh 요청 (Mac은 LTR-P, ACK된 LTR 없으면 IDR)
+message KeyframeRequest {
+  uint32 last_good_frame = 1;          // 마지막으로 온전히 받은 frame_id
+}
+
+// Android → Mac: LTR 프레임 수신 확인 (frame_id로 ACK). Mac이 frame_id→LTR토큰 매핑.
+message LtrAck {
+  uint32 frame_id = 1;
+}
+
+// Android → Mac: Transport-CC 피드백 (수신측은 측정만 함)
+message TransportFeedback {
+  uint32 feedback_seq = 1;             // 피드백 메시지 자체 순번
+  uint32 base_seq = 2;                 // 보고 구간 시작 video seq
+  repeated PacketArrival arrivals = 3; // 도착한 패킷들 (델타 인코딩, v0.1 미사용)
+  repeated uint32 lost_seqs = 4;       // 손실된 video seq 목록 (v0.1 미사용)
+  // v0.1 경량 손실률 요약: loss = 1 - received_count/(highest_seq - base_seq + 1)
+  uint32 highest_seq = 5;              // 보고 구간에서 받은 최대 packet_seq
+  uint32 received_count = 6;           // 보고 구간 실제 수신 패킷 수
+  // 지연 인식형 비트레이트 제어용: 수신측 적응 지터버퍼가 추정한 큐잉 지연(ms).
+  // = 최근 (도착-PTS) - 최단경로(도착-PTS). 손실 0이라도 Wi-Fi 버퍼블로트를 드러냄.
+  uint32 queue_delay_ms = 7;
+  // 수신측 파이프라인 구간 통계(최근 1초 평균, ms) — Mac 상세 화면의 지연 스택 표시용.
+  // 값 자체는 VideoDecoder.recordTiming이 이미 계산해 로그로 찍던 것(계측 재사용, 제어에 미사용).
+  // 0 = 미보고(클럭 미동기 등). macEnc는 Mac이 로컬에서 직접 재므로 여기 없음.
+  uint32 pipe_net_ms = 8;    // 네트워크+재조립 (송신→submit, 클럭오프셋 매핑)
+  uint32 pipe_jbuf_ms = 9;   // 수신 지터버퍼 대기 (render-on-arrival이면 ~0)
+  uint32 pipe_dec_ms = 10;   // 디코드
+  uint32 rtt_ms = 11;        // 마지막 Ping→Pong 왕복(ms)
+}
+
+message PacketArrival {
+  uint32 seq = 1;
+  sint32 arrival_delta_us = 2;         // 직전 패킷 대비 도착 시각 차
+}
+
+// Mac → Android: 수신측 재생 정책. Mac UI 프로파일 토글로 라이브 조절.
+//  - render_on_arrival=true (Low Latency): 지터버퍼 없이 도착 즉시 렌더 (buffer_ms 무시)
+//  - render_on_arrival=false (High Quality): buffer_ms 깊이의 고정 지터버퍼로 평활
+message PlayoutConfig {
+  uint32 buffer_ms = 1;
+  bool   render_on_arrival = 2;
+}

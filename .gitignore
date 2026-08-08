@@ -1,0 +1,89 @@
+# ==============================================================================
+# Mac-Android Continuity Project Root .gitignore
+# ==============================================================================
+
+# --- macOS & OS System Files ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Xcode & Swift / MacApp Build Artifacts ---
+build/
+**/build/
+DerivedData/
+**/DerivedData/
+.build/
+**/.build/
+.swiftpm/
+**/.swiftpm/
+*.swiftmodule
+**/xcuserdata/
+**/*.xcodeproj/xcuserdata/
+**/*.xcodeproj/project.xcworkspace/xcuserdata/
+**/*.xcworkspace/xcuserdata/
+**/*.playground/xcuserdata/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+*.hmap
+*.ipa
+*.dSYM/
+
+# --- Android & Gradle / AndroidApp & HardwareInformation ---
+.gradle/
+**/.gradle/
+**/build/
+local.properties
+**/local.properties
+.idea/
+**/.idea/
+*.iml
+**/*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+**/aar/
+**/ap_generated_sources/
+**/intermediates/
+**/outputs/
+**/tmp/
+*.apk
+*.aab
+*.hprof
+
+# --- Security & Signing Keys ---
+*.keystore
+*.jks
+
+# --- Compiled Java / Kotlin / Binary Artifacts ---
+*.class
+*.jar
+!**/gradle-wrapper.jar
+
+# --- IDEs / Editors (VS Code, JetBrains, Xcode User Settings) ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# --- Temporary & Log Files ---
+*.log
+*.tmp
+*.bak
+*.swp
+*~

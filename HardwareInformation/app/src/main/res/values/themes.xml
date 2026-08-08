@@ -1,0 +1,8 @@
+<resources>
+    <!--
+      Pure-Compose app: the XML theme only has to give the window a sane background before the first
+      frame. Colours, typography and dark mode all come from HardwareInformationTheme, so there is no
+      appcompat or Material Components dependency here.
+    -->
+    <style name="Theme.HardwareInformation" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
