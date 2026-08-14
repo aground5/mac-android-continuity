@@ -245,13 +245,16 @@ sealed interface Fx {
     data object StopKeepalive : Fx
 
     /**
-     * 디코더가 없으면 만든다 — **세션이 서는 모든 문에서 나온다.**
+     * 앱들에게 "말할 채널이 생겼다"를 알린다 — **세션이 서는 모든 문에서 나온다.**
+     *
+     * 무엇을 세울지는 앱마다 다르다: 확장은 디코더를, 공유는 재동의 대기를, 알림은 권한
+     * 재확인을 한다. 기계는 그 어휘를 모르고 알 필요도 없다(원칙 1).
      *
      * 예전엔 디코더 생성이 기계 밖(`startPunch`/`connect`/`reconnectNow`)에 흩어져 있었고,
      * 그 사이에 `DropSession`이 끼면 아무도 다시 만들지 않았다. 영상은 도착하는데 그릴 곳이
      * 없어 검은 화면이 됐다. 세션 확립·무손실 재개 둘 다 여기를 지난다.
      */
-    data object EnsureDecoder : Fx
+    data object AttachApps : Fx
     data object CloseTransport : Fx
     data object SendBye : Fx
 
@@ -369,7 +372,7 @@ fun reduce(s: MirrorState, ev: Ev): Step = when (ev) {
         if (s.path is Path.Live) {
             Step(
                 s.copy(sess = Sess.Live(ev.peer), retries = 0),
-                listOf(Fx.CancelHandshakeWatchdog, Fx.EnsureDecoder, Fx.StartKeepalive),
+                listOf(Fx.CancelHandshakeWatchdog, Fx.AttachApps, Fx.StartKeepalive),
             )
         } else {
             // ★ 경로가 이미 죽은 뒤에 도착한 ServerHello. read 루프가 프레임을 넘긴 직후
@@ -468,7 +471,7 @@ fun reduce(s: MirrorState, ev: Ev): Step = when (ev) {
     // Mac의 생존감지(6s)가 방금 살려낸 세션을 도로 죽인다(실기기에서 겪음).
     is Ev.PathSwapped ->
         if (s.sess is Sess.Live) {
-            Step(s.copy(path = Path.Live(Via.LAN)), listOf(Fx.EnsureDecoder, Fx.StartKeepalive))
+            Step(s.copy(path = Path.Live(Via.LAN)), listOf(Fx.AttachApps, Fx.StartKeepalive))
         } else {
             // ★ 재개할 세션이 없는데 교체 성공 보고가 왔다 = 워치독(30s)이 먼저 터져 라운드를
             // 접은 뒤 펀칭 스레드가 뒤늦게 성공한 경합이다. 그 소켓은 Mac 쪽에서 RESUME으로

@@ -15,6 +15,15 @@ import java.util.concurrent.locks.LockSupport
 private const val TAG = "VideoDecoder"
 
 /**
+ * 프레임을 넣고 있는데 이만큼 출력이 없으면 **코덱이 안에서 멎은 것으로 본다.**
+ *
+ * 짧게 잡을 수 없다: `output.delay`가 20 안팎이라(실기기 로그에서 25) 정상 기동에도
+ * 수십 프레임이 들어간 뒤에야 첫 출력이 나온다. 2초면 30fps 기준 60프레임이라 그 지연을
+ * 넉넉히 덮으면서, 사람이 "멈췄나?" 하기 직전에 스스로 복구한다.
+ */
+private const val OUTPUT_STALL_NS = 2_000_000_000L
+
+/**
  * Annex-B H.264/H.265 비트스트림을 받아 Surface에 디코딩 렌더링한다 (슬라이스1).
  *
  * 첫 키프레임에서 SPS/PPS(+VPS)를 추출해 MediaCodec을 설정한다. 키프레임 전
@@ -55,15 +64,34 @@ class VideoDecoder(private val surface: Surface) {
     private val configGen = java.util.concurrent.atomic.AtomicInteger(0)
 
     /** Mac SessionParams가 확정한 다이내믹 레인지를 반영한다. 값이 바뀌면 디코더를 다시 만든다.
-     *  @return 재구성이 필요해졌으면 true (호출자가 키프레임을 요청해야 한다 — 주기 IDR이 없어서
-     *          그냥 두면 다음 키프레임까지 화면이 멈춘다). */
+     *  @return 재구성이 필요해졌으면 true (호출자가 키프레임을 요청해야 한다 — 확장 경로의
+     *          주기 IDR은 2초라 그냥 두면 그만큼 화면이 멈춘다). */
     fun applyDynamicRange(hdr10: Boolean, staticInfo: ByteArray?): Boolean {
         val changed = (this.hdr10 != hdr10) || !(this.hdrStaticInfo contentEquals staticInfo)
         this.hdr10 = hdr10
         this.hdrStaticInfo = staticInfo
-        if (changed) configGen.incrementAndGet()
+        if (changed) {
+            configGen.incrementAndGet()
+            // 곧 버려질 디코더다 — 참조는 **지금** 없어진 것으로 본다. 루프가 실제로
+            // 다시 세울 때까지 기다리면 그 사이의 갱신 요청이 "참조가 있다"고 거짓말한다.
+            hasReferences = false
+        }
         return changed
     }
+
+    /**
+     * 이 디코더에 **참조 프레임이 있는가** — 키프레임을 받아 실제로 서 있는 상태인가.
+     *
+     * 갱신을 청할 때 무엇을 청할지가 이 값 하나로 갈린다. 참조가 있으면 작은 LTR-P로
+     * 이어 그릴 수 있지만, 없으면 SPS/PPS가 실린 IDR이라야 한다 — LTR-P는 아무리 받아도
+     * 풀 수가 없어서 화면이 검은 채로 남는다.
+     *
+     * **디코더가 답해야 하는 질문이다.** 호출부가 "지금쯤 참조가 있겠지"로 고르면 언젠가
+     * 틀리고, 틀린 그 경우가 정확히 검은 화면이다.
+     */
+    @Volatile
+    var hasReferences: Boolean = false
+        private set
 
     // 지연 계측 1초 집계 (구간별 µs 누적 + 카운트). recordTiming에서 사용.
     private var tMacEnc = 0L; private var tNet = 0L; private var tJbuf = 0L
@@ -127,9 +155,39 @@ class VideoDecoder(private val surface: Surface) {
 
     fun stop() {
         running.set(false)
+        hasReferences = false
         thread?.interrupt()
         thread = null
         queue.clear()
+    }
+
+    /** 키프레임을 기다리며 버린 프레임 수 — 검은 화면의 길이가 곧 이 값이다. */
+    private var droppedWaiting = 0
+    private var waitingSinceNs = 0L
+    private var lastWaitLogNs = 0L
+
+    /** 마지막으로 **화면에 나간** 시각. 코덱이 안에서 멎었는지 판정하는 유일한 근거. */
+    private var lastOutputNs = 0L
+
+    /**
+     * 디코더가 스스로 복구할 수 없어 **IDR이 필요하다**. 확장 앱이 갱신 요청으로 잇는다.
+     *
+     * 왜 디코더가 청하는가: 손상을 실제로 만나는 곳이 여기뿐이다. 세션은 패킷이 도착했다는
+     * 것까지만 알고, 그 패킷이 그려졌는지는 모른다.
+     *
+     * 사유를 **자기 어휘로** 넘긴다([Fault]) — 와이어 enum을 여기서 알면 미디어 부품이
+     * 프로토콜에 매인다. 옮겨 적는 건 확장 앱의 몫이다.
+     */
+    @Volatile
+    var onNeedIdr: ((Fault) -> Unit)? = null
+
+    /** 디코더가 스스로 못 고치는 두 가지. 둘 다 결과는 같다 — 코덱을 버리고 다시 세운다. */
+    enum class Fault {
+        /** 손상된 비트스트림에 코덱이 예외를 냈다. */
+        DECODE_ERROR,
+
+        /** 넣는데 안 나온다 — 코덱이 안에서 멎었다. */
+        OUTPUT_STALL,
     }
 
     private fun loop() {
@@ -148,18 +206,67 @@ class VideoDecoder(private val surface: Surface) {
                     codec = null
                 }
 
-                // 첫 키프레임 전까지는 설정 불가 → 폐기
+                // 첫 키프레임 전까지는 설정 불가 → 폐기.
+                //
+                // ★ **이 대기를 반드시 소리 내어 말한다.** 예전엔 조용히 `continue`였고,
+                // 그래서 "검은 화면인데 로그가 하나도 안 나온다"가 됐다. 실패가 아니라
+                // **아무 일도 안 일어나는** 상태라 어디에도 흔적이 없었다 — 패킷은 도착하고,
+                // 복호도 성공하고, 통계도 돌고, 화면만 검다.
+                //
+                // 이 줄이 진단에서 하는 일이 정확히 하나 있다: **검은 화면의 원인을 둘로
+                // 가른다.** 확장 인코더는 2초마다 IDR을 내므로, 이 경고가 2초 넘게 이어지면
+                // 프레임이 오긴 오는데 키프레임이 안 오는 것이고, 이 경고가 아예 안 찍히면
+                // 프레임 자체가 안 오는 것이다(그때는 `영상이 …ms째 없다`가 대신 찍힌다).
                 if (codec == null) {
-                    if (!frame.keyframe) continue
+                    if (!frame.keyframe) {
+                        droppedWaiting++
+                        val now = System.nanoTime()
+                        if (waitingSinceNs == 0L) waitingSinceNs = now
+                        if (now - lastWaitLogNs > 1_000_000_000L) {
+                            lastWaitLogNs = now
+                            Log.w(TAG, "키프레임 대기 중 — ${droppedWaiting}프레임 폐기 " +
+                                "(${(now - waitingSinceNs) / 1_000_000}ms). 갱신 요청이 나갔는지 확인할 것")
+                        }
+                        continue
+                    }
                     codecGen = configGen.get()
                     codec = configure(frame) ?: continue
+                    hasReferences = true
+                    lastOutputNs = System.nanoTime()   // 출력 감시의 기준점
+                    if (droppedWaiting > 0) {
+                        Log.i(TAG, "키프레임 도착 — ${droppedWaiting}프레임 버리고 재생 시작 " +
+                            "(${(System.nanoTime() - waitingSinceNs) / 1_000_000}ms 대기)")
+                    }
+                    droppedWaiting = 0
+                    waitingSinceNs = 0L
                 }
 
                 pace(frame.ptsUs, frame.arrivalNs)   // 적응형 PTS 페이싱 (입력측 지터 흡수)
                 val releaseNs = System.nanoTime()    // 지터버퍼 대기 끝 → 디코드 투입 시각
-                feed(codec, frame)
-                drain(codec, bufferInfo)
+                try {
+                    feed(codec, frame)
+                    drain(codec, bufferInfo)
+                } catch (e: IllegalStateException) {
+                    // ★ `MediaCodec.CodecException`이 여기 포함된다(그 부모가 IllegalState다).
+                    //
+                    // 예전엔 이 예외가 루프 **전체**를 빠져나갔다. 그러면 스레드가 죽는데
+                    // `decoder` 참조는 non-null로 남고 `hasReferences`도 true인 채라, 바깥에서
+                    // 보기에 디코더는 멀쩡히 서 있다. 아무도 다시 세우지 않고, 갱신을 청해도
+                    // "참조가 있다"고 답한다 — 로그 한 줄과 영구 검은 화면.
+                    //
+                    // 손상된 비트스트림 한 장에 세션이 끝나서는 안 된다. 코덱만 버리고
+                    // 처음부터 다시 세운다.
+                    codec = rebuild(codec, Fault.DECODE_ERROR, e.message ?: "?")
+                    continue
+                }
                 recordTiming(frame, releaseNs, System.nanoTime())   // 구간별 지연 계측
+
+                // 넣기만 하고 안 나온다 = 코덱이 안에서 멎었다. 입력 예외도 아니라서
+                // 위 갈래에 안 걸리고, 그대로 두면 화면이 마지막 프레임에 얼어붙는다.
+                val sinceOutputMs = (System.nanoTime() - lastOutputNs) / 1_000_000
+                if (sinceOutputMs > OUTPUT_STALL_NS / 1_000_000) {
+                    codec = rebuild(codec, Fault.OUTPUT_STALL, "${sinceOutputMs}ms째 출력 없음")
+                }
             }
         } catch (_: InterruptedException) {
             // stop()
@@ -245,12 +352,31 @@ class VideoDecoder(private val surface: Surface) {
         while (true) {
             val index = codec.dequeueOutputBuffer(info, 0)
             when {
-                index >= 0 -> codec.releaseOutputBuffer(index, true) // Surface에 즉시 렌더
+                index >= 0 -> {
+                    codec.releaseOutputBuffer(index, true)   // Surface에 즉시 렌더
+                    lastOutputNs = System.nanoTime()         // 살아 있다는 유일한 증거
+                }
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                     Log.i(TAG, "output format: ${codec.outputFormat}")
                 else -> return
             }
         }
+    }
+
+    /**
+     * 코덱을 버리고 처음부터 다시 세운다 — **IDR을 청하고 돌아온다.**
+     *
+     * 참조를 먼저 내리는 순서가 중요하다. [onNeedIdr]이 부르는 쪽은 [hasReferences]를 보고
+     * 무엇을 청할지 정하는데, 그 전에 내려두지 않으면 "참조가 있다"고 답해 작은 LTR-P를
+     * 받게 되고 — 방금 코덱을 버린 우리는 그걸 풀 수 없다.
+     */
+    private fun rebuild(codec: MediaCodec?, fault: Fault, detail: String): MediaCodec? {
+        Log.w(TAG, "디코더 재구성 — $fault ($detail)")
+        runCatching { codec?.stop() }
+        runCatching { codec?.release() }
+        hasReferences = false
+        onNeedIdr?.invoke(fault)
+        return null
     }
 
     /**

@@ -66,8 +66,18 @@ class PairingCoordinator(context: Context) {
      */
     var candidateProvider: ((CandidateBundle) -> CandidateBundle)? = null
 
-    /** Mac 후보 도착 + 개시 신호 → 홀펀칭 개시. */
-    var onRemoteCandidates: ((CandidateBundle) -> Unit)? = null
+    /**
+     * Mac 후보 도착 + 개시 신호 → 홀펀칭 개시.
+     *
+     * `peerPub`는 **이 라운드에서 신원이 확인된 Mac의 장기 공개키**다. 왜 같이 보내는가:
+     * 뒤이은 LAN 핸드셰이크는 "내 신뢰 목록의 누구인가"까지만 스스로 답할 수 있어서,
+     * Mac을 둘 페어링해 뒀다면 A에게 걸었는데 B가 응답해도 통과한다. 지금 이 순간 우리는
+     * 상대가 누군지 **이미 알고 있으므로**(봉인된 BLE 채널 안에서 확인했다) 그 사실을
+     * 버리지 않고 넘긴다.
+     *
+     * null이 되는 경로는 없어야 정상이다 — 두 라운드 모두 신원 확인이 끝난 뒤에 여기 온다.
+     */
+    var onRemoteCandidates: ((bundle: CandidateBundle, peerPub: ByteArray?) -> Unit)? = null
 
     // 실행기가 들고 있는 재료
     private var machine = PairState()
@@ -323,7 +333,15 @@ class PairingCoordinator(context: Context) {
                     Log.w(TAG, "개시 신호가 왔는데 Mac 후보가 없다"); return
                 }
                 pendingRemote = null
-                onRemoteCandidates?.invoke(bundle)
+                // ★ 재료가 아직 살아 있을 때 읽는다. `EndRound`가 이 둘을 비우는데, 기계가
+                // 이 부작용을 내는 전이(PunchStart → Done)는 그보다 앞이다.
+                val peerPub = roundPeerPub()
+                // 두 라운드 모두 신원 확인이 끝난 뒤에야 여기 오므로 null이 될 수 없다.
+                // 그래도 막지는 않는다 — 여기서 끊으면 못 찾은 경로 하나가 곧 접속 불가가
+                // 된다. 대신 조용히 넘어가지 않게 남긴다: 이 줄이 찍히면 뒤이은 핸드셰이크의
+                // 상대 대조가 꺼진 채로 도는 것이다.
+                if (peerPub == null) Log.w(TAG, "펀칭 개시인데 확인된 Mac 신원이 없다 — 상대 대조 없이 진행")
+                onRemoteCandidates?.invoke(bundle, peerPub)
             }
 
             is PairFx.ArmDeadline -> {
@@ -514,6 +532,22 @@ class PairingCoordinator(context: Context) {
         Log.i(TAG, "펀칭 개시 신호 수신 → 즉시 시작")
         dispatch(PairEv.PunchStart)
     }
+
+    /**
+     * 이 라운드에서 **신원이 확인된** Mac의 장기 공개키.
+     *
+     * 두 경로가 각자 다른 자리에 답을 남긴다. 어느 쪽이든 그 값이 나온 지점이 곧 상대가
+     * 확정된 지점이라 여기서 고를 뿐 새로 판단하지 않는다:
+     *
+     *  · PAKE(첫 페어링) — [peerCert]. 봉인된 채널이 열렸다는 것 자체가 Mac이 PIN을
+     *    알았다는 증거이고, 그 채널로 온 인증서의 자기서명까지 확인했다([onIdentity]).
+     *  · STS(재연결) — [stsPeer]. TOTP 힌트가 짚고, 이번 전사의 서명이 **그 사람의 키로**
+     *    검증된 상대다([onStsResponse]).
+     *
+     * 둘이 같이 채워지는 경로는 없다. 그래도 순서를 정해 두는 건, 나중에 STS 라운드가
+     * 신원 갱신까지 하게 되더라도 "방금 확인한 쪽"이 이기게 하기 위해서다.
+     */
+    private fun roundPeerPub(): ByteArray? = peerCert?.pub ?: stsPeer?.pub
 
     /** [12B nonce][ciphertext‖tag] → 평문. 세션이 없거나 열리지 않으면 null. */
     private fun open(payload: ByteArray): ByteArray? {

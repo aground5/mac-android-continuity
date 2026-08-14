@@ -903,6 +903,14 @@ final class Session: ObservableObject, Identifiable {
 /// LanServer 1개를 소유하고 클라이언트별 Session을 생성·라우팅한다. 여러 Android를 동시 송출.
 @MainActor
 final class SessionManager: ObservableObject {
+
+    /// 세대 id의 앞 4바이트 — 로그에서 세대를 눈으로 대조하는 키.
+    ///
+    /// Android도 같은 자리(`id.take(4)`)를 같은 형식으로 찍는다. 두 로그의 이 값이 다르면
+    /// 세대가 갈린 것이고, 같은데 HELLO가 안 맞으면 봉인 쪽 문제다.
+    nonisolated static func hex(_ d: Data) -> String {
+        d.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
     @Published private(set) var isRunning = false
     @Published private(set) var statusMessage = "준비됨"
     @Published private(set) var localIP = "—"
@@ -1322,10 +1330,18 @@ final class SessionManager: ObservableObject {
             for s in self.router.all()
             where s.acceptsHello(channel: h.channel, nonce: h.nonce, body: h.body) {
                 s.linkUdp(peerID)
-                log.info("udp HELLO → 세대 매칭, 영상 피어 연결")
+                log.info("udp HELLO → 세대 \(Self.hex(h.channel)) 매칭, 영상 피어 연결")
                 return
             }
-            log.error("udp HELLO: 열려 있는 세대 중 맞는 것이 없음")
+            // ★ **양쪽 id를 다 찍는다.** 이 줄이 안 그러던 때가 있었는데, 그러면 "안 맞는다"
+            // 까지만 알고 무엇이 안 맞는지는 알 수 없다 — 세대가 갈린 것인지(둘 다 열려 있는데
+            // 번호가 다르다), 아예 안 열린 것인지(목록이 비었다), 봉인이 안 풀린 것인지
+            // (번호는 같은데 안 맞는다)가 전부 같은 한 줄로 보였다. 셋의 원인은 다 다르다.
+            let open = self.router.all().compactMap { $0.datagramChannelID }.map(Self.hex)
+            log.error("""
+                udp HELLO: 맞는 세대 없음 — 들어온 id=\(Self.hex(h.channel)), \
+                열려 있는 세대=[\(open.joined(separator: ", "))]
+                """)
         }
         // UDP 영상(화면 공유) → 그 피어를 가진 세션. HELLO가 이미 주소↔세션을 묶어 놨으므로
         // 여기선 조회 한 번이면 된다 — 프레임마다 시도복호화를 돌릴 이유가 없다.

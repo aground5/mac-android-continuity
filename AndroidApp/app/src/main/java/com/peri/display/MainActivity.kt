@@ -288,7 +288,12 @@ private fun MirrorApp(initialSpec: DisplaySpec) {
         // ICE — Mac이 준 토큰을 그대로 실어 내 후보를 만들고, Mac 후보가 오면 펀칭을 시작한다.
         // STUN은 미디어에 쓸 그 소켓에서 나가야 하므로 수집은 controller(전송 소유자)가 한다.
         pairing.candidateProvider = { remote -> controller.gatherCandidates(remote) }
-        pairing.onRemoteCandidates = { bundle -> controller.beginPunch(bundle, latestSpec) }
+        // 후보와 **그 후보를 준 Mac의 신원**을 같이 넘긴다. 뒤이은 LAN 핸드셰이크가
+        // "내가 걸려던 그 Mac인가"를 대조하는 근거가 여기서만 나온다 — BLE 라운드가
+        // 봉인된 채널 안에서 이미 확인한 값이라 다시 물을 필요가 없다.
+        pairing.onRemoteCandidates = { bundle, peerPub ->
+            controller.beginPunch(bundle, latestSpec, expecting = peerPub)
+        }
         // 핸드오버(LTE↔Wi-Fi)·USB 분리: 광고에 재협상 비트를 세워 Mac을 부르고,
         // 라운드가 끝나면(성공·실패 무관) 내린다. IP에 독립적인 유일한 신호 경로가 BLE다.
         controller.onIceRestartNeeded = { pairing.requestIceRestart() }

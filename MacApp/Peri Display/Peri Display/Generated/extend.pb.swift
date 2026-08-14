@@ -226,7 +226,18 @@ public nonisolated struct PeriDisplayConfig: Sendable {
   public init() {}
 }
 
-/// Android → Mac: 손실/복구 시 refresh 요청 (Mac은 LTR-P, ACK된 LTR 없으면 IDR)
+/// Android → Mac: 갱신 요청.
+///
+/// ★ **두 요청은 다른 요청이다.** 예전엔 하나였고, 그게 실기기의 검은 화면이었다.
+///
+/// Mac은 이 메시지를 받으면 LTR-P를 낸다 — ACK된 장기 참조를 가리키는 작은 프레임이라
+/// 손실 복구에는 이상적이다(IDR은 스트림에서 가장 큰 버스트라 Wi-Fi 큐를 포화시킨다).
+/// 그런데 **방금 선 디코더에는 참조 프레임이 하나도 없다.** LTR-P를 아무리 받아도 풀
+/// 수가 없어서 `keyframe=false`로 계속 버려지고, 인코더가 우연히 IDR을 낼 때까지 화면이
+/// 검은 채로 남는다. 실기기 로그에서 3963ms · 111프레임이 그렇게 버려졌다.
+///
+/// 그래서 "이어 그릴 수 있는가"를 수신측이 말해 준다. 그 답을 아는 쪽은 디코더를 가진
+/// 쪽뿐이고, Mac은 추측할 방법이 없다.
 public nonisolated struct PeriKeyframeRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -235,7 +246,121 @@ public nonisolated struct PeriKeyframeRequest: Sendable {
   /// 마지막으로 온전히 받은 frame_id
   public var lastGoodFrame: UInt32 = 0
 
+  public var need: PeriKeyframeRequest.Need = .unspecified
+
+  public var cause: PeriKeyframeRequest.Cause = .unspecified
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public nonisolated enum Need: SwiftProtobuf.Enum, Swift.CaseIterable {
+    public typealias RawValue = Int
+
+    /// 옛 피어. 손실 복구로 취급한다(기존 동작) — 새 필드를 안 보내던 시절과 같다.
+    case unspecified // = 0
+
+    /// 참조는 살아 있다. 앞으로 그릴 수 있게만 해 달라 → 작은 LTR-P로 충분하다.
+    case refresh // = 1
+
+    /// **참조가 하나도 없다**(디코더를 방금 세웠다). SPS/PPS가 실린 IDR이라야 한다.
+    case idr // = 2
+    case UNRECOGNIZED(Int)
+
+    public init() {
+      self = .unspecified
+    }
+
+    public init?(rawValue: Int) {
+      switch rawValue {
+      case 0: self = .unspecified
+      case 1: self = .refresh
+      case 2: self = .idr
+      default: self = .UNRECOGNIZED(rawValue)
+      }
+    }
+
+    public var rawValue: Int {
+      switch self {
+      case .unspecified: return 0
+      case .refresh: return 1
+      case .idr: return 2
+      case .UNRECOGNIZED(let i): return i
+      }
+    }
+
+    // The compiler won't synthesize support with the UNRECOGNIZED case.
+    public static let allCases: [PeriKeyframeRequest.Need] = [
+      .unspecified,
+      .refresh,
+      .idr,
+    ]
+
+  }
+
+  /// **왜 청하는가.** [Need]가 "무엇을 달라"라면 이건 "무슨 일이 있었나"다.
+  ///
+  /// 복구에는 쓰이지 않는다 — Mac은 [Need]만 보고 무엇을 낼지 정한다. 이 필드는 순전히
+  /// **두 로그를 붙이기 위해** 있다. 갱신은 화면이 검거나 멈췄을 때만 일어나는데, 그때
+  /// Mac 로그에는 "IDR 냄"만 남고 Android 로그에는 "청함"만 남아서 둘을 타임스탬프로
+  /// 눈대중 맞춰야 했다. 이유가 선을 타고 오면 Mac 로그 한 줄에 원인과 대응이 같이 찍힌다.
+  public nonisolated enum Cause: SwiftProtobuf.Enum, Swift.CaseIterable {
+    public typealias RawValue = Int
+    case unspecified // = 0
+
+    /// 디코더를 세웠다 — 참조가 하나도 없다
+    case decoderStarted // = 1
+
+    /// packet_seq 갭
+    case packetLoss // = 2
+
+    /// SDR↔HDR 전환으로 코덱을 다시 만든다
+    case dynamicRange // = 3
+
+    /// 손상된 비트스트림에 코덱이 예외를 냈다
+    case decodeError // = 4
+
+    /// 넣는데 안 나온다 — 코덱이 안에서 멎었다
+    case outputStall // = 5
+    case UNRECOGNIZED(Int)
+
+    public init() {
+      self = .unspecified
+    }
+
+    public init?(rawValue: Int) {
+      switch rawValue {
+      case 0: self = .unspecified
+      case 1: self = .decoderStarted
+      case 2: self = .packetLoss
+      case 3: self = .dynamicRange
+      case 4: self = .decodeError
+      case 5: self = .outputStall
+      default: self = .UNRECOGNIZED(rawValue)
+      }
+    }
+
+    public var rawValue: Int {
+      switch self {
+      case .unspecified: return 0
+      case .decoderStarted: return 1
+      case .packetLoss: return 2
+      case .dynamicRange: return 3
+      case .decodeError: return 4
+      case .outputStall: return 5
+      case .UNRECOGNIZED(let i): return i
+      }
+    }
+
+    // The compiler won't synthesize support with the UNRECOGNIZED case.
+    public static let allCases: [PeriKeyframeRequest.Cause] = [
+      .unspecified,
+      .decoderStarted,
+      .packetLoss,
+      .dynamicRange,
+      .decodeError,
+      .outputStall,
+    ]
+
+  }
 
   public init() {}
 }
@@ -642,7 +767,7 @@ nonisolated extension PeriDisplayConfig: SwiftProtobuf.Message, SwiftProtobuf._M
 
 nonisolated extension PeriKeyframeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".KeyframeRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}last_good_frame\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}last_good_frame\0\u{1}need\0\u{1}cause\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -651,6 +776,8 @@ nonisolated extension PeriKeyframeRequest: SwiftProtobuf.Message, SwiftProtobuf.
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.lastGoodFrame) }()
+      case 2: try { try decoder.decodeSingularEnumField(value: &self.need) }()
+      case 3: try { try decoder.decodeSingularEnumField(value: &self.cause) }()
       default: break
       }
     }
@@ -660,14 +787,30 @@ nonisolated extension PeriKeyframeRequest: SwiftProtobuf.Message, SwiftProtobuf.
     if self.lastGoodFrame != 0 {
       try visitor.visitSingularUInt32Field(value: self.lastGoodFrame, fieldNumber: 1)
     }
+    if self.need != .unspecified {
+      try visitor.visitSingularEnumField(value: self.need, fieldNumber: 2)
+    }
+    if self.cause != .unspecified {
+      try visitor.visitSingularEnumField(value: self.cause, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: PeriKeyframeRequest, rhs: PeriKeyframeRequest) -> Bool {
     if lhs.lastGoodFrame != rhs.lastGoodFrame {return false}
+    if lhs.need != rhs.need {return false}
+    if lhs.cause != rhs.cause {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
+}
+
+nonisolated extension PeriKeyframeRequest.Need: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0NEED_UNSPECIFIED\0\u{1}NEED_REFRESH\0\u{1}NEED_IDR\0")
+}
+
+nonisolated extension PeriKeyframeRequest.Cause: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0CAUSE_UNSPECIFIED\0\u{1}CAUSE_DECODER_STARTED\0\u{1}CAUSE_PACKET_LOSS\0\u{1}CAUSE_DYNAMIC_RANGE\0\u{1}CAUSE_DECODE_ERROR\0\u{1}CAUSE_OUTPUT_STALL\0")
 }
 
 nonisolated extension PeriLtrAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {

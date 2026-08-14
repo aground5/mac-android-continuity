@@ -75,6 +75,15 @@ final class ExtendService: ObservableObject, PeriApp {
     /// 어차피 다시 나간다.
     private var channel: ServiceChannel?
 
+    /**
+     인코더 콜백이 보는 **지금** 채널.
+
+     [channel]과 값이 같지만 접근 축이 다르다: 이쪽은 인코더 스레드에서 락으로 읽는다.
+     캡처가 아니라 조회여야 하는 이유는 [ChannelBox] 주석에 있다 — 한 줄로 줄이면,
+     파이프라인은 세션보다 오래 살고 채널은 그렇지 않다.
+     */
+    private let channelBox = ChannelBox()
+
     /// 이 전송에서 허용하는 협상 상한(fps·비트레이트). **채널이 답한다** —
     /// 케이블을 꽂으면 같은 서비스가 그대로 AOA 상한으로 갈아탄다.
     private var limits: ExtendLimits { .of(reliableStream: channel?.caps.reliableStream ?? false) }
@@ -204,6 +213,13 @@ final class ExtendService: ObservableObject, PeriApp {
         }
         lastTransportReliable = ch.caps.reliableStream
         channel = ch
+        // ★ **돌고 있는 파이프라인의 목적지를 여기서 갈아끼운다.**
+        //
+        // 기계는 `unlinked`에서 파이프라인을 일부러 살려 두고 `linked`에서 이미 서 있으면
+        // 손대지 않는다(그게 무중단 재개의 근거다). 그래서 전송이 갈려 채널이 새 객체가 돼도
+        // `buildPipeline`은 나오지 않는다 — 이 한 줄이 없으면 인코더는 죽은 옛 채널로 계속
+        // 쏘고, 프레임은 `isDatagramPathReady`에서 조용히 전부 버려진다.
+        channelBox.channel = ch
         // 최신성 경로가 열리는 순간 = 수신측이 아직 아무 참조 프레임도 없는 순간 → 즉시 IDR.
         // (손실 복구의 LTR-P와 다르다. 저쪽엔 되살릴 참조가 아예 없다.)
         ch.onDatagramPathReady { [weak self] in self?.inbox.requestKeyframeNow() }
@@ -223,6 +239,9 @@ final class ExtendService: ObservableObject, PeriApp {
     func detach(_ reason: DetachReason) async {
         channel?.onDatagramPathReady(nil)
         channel = nil
+        // 파이프라인은 살아 있을 수 있다(기계가 그렇게 정한다). 목적지만 비워 두면 그 동안
+        // 구운 프레임은 갈 곳이 없어 조용히 버려지고, 새 채널이 붙는 순간 다시 흐른다.
+        channelBox.channel = nil
         await dispatch(.unlinked)
         if case .deviceGone(let why) = reason {
             await quit(why)
@@ -295,8 +314,8 @@ final class ExtendService: ObservableObject, PeriApp {
     nonisolated func receive(_ msg: AppMessage) {
         guard case .control(let m) = msg else { return }
         switch m.payload {
-        case .keyframeRequest:
-            inbox.onKeyframeRequest()   // 복구: 작은 LTR-P (ACK된 LTR 없으면 IDR 폴백)
+        case .keyframeRequest(let req):
+            inbox.onKeyframeRequest(req.need, cause: req.cause)
 
         case .ltrAck(let ack):
             inbox.onLtrAck(frameId: ack.frameID)
@@ -466,10 +485,14 @@ final class ExtendService: ObservableObject, PeriApp {
         adopt(np, why: "renegotiate")
     }
 
-    /// 협상값을 채택한다 — 클라에 통지하고, 기기 기계에는 **디스플레이 제원만** 사실로 올린다.
+    /// 협상값을 채택한다 — 기기 기계에 **디스플레이 제원만** 사실로 올린다.
+    ///
+    /// ★ **여기서 클라에 알리지 않는다.** 협상값의 다이내믹 레인지는 그 타입의 주석대로
+    /// "희망값이지 확정값이 아니고", 클라는 `SessionParams`만 믿고 디코더를 세운다.
+    /// 증명 전에 알리면 SDR 비트스트림을 PQ로 해석해 색이 통째로 틀어진다 —
+    /// 알리는 자리는 확정하는 자리([confirmDynamicRange])와 같아야 한다.
     private func adopt(_ np: NegotiatedParams, why: String) {
         lastParams = np
-        sendSessionParams(np)
         log.info("\(why) → \(np.width)x\(np.height) codec=\(np.codec == .h265 ? "H265" : "H264") fps=\(np.fps) \(np.wantsHDR ? "HDR10" : "SDR")")
         Task { await self.dispatch(.specChanged(np.displaySpec)) }
     }
@@ -677,11 +700,21 @@ final class ExtendService: ObservableObject, PeriApp {
     ///
     /// 판정 근거는 EDR 헤드룸 하나뿐이다. `transferFunction=1` 선언이 먹었는지는 macOS가 따로
     /// 알려주지 않고, 여기서 잘못 믿으면 SDR 소스를 10비트 PQ로 인코딩해 폰에서 잿빛으로 뜬다.
-    /// 강등하면 클라에도 다시 알린다 — 클라는 SessionParams만 믿고 디코더를 세우기 때문이다.
+    ///
+    /// ★ **`SessionParams`를 보내는 유일한 곳이다.** 클라는 그 메시지만 믿고 디코더를 세우고,
+    /// 무엇을 굽는지 아는 건 여기뿐이다. 예전엔 협상 직후(`adopt`)에도 보냈는데, 그 값은 아직
+    /// 증명 전이라 실기기에서 이렇게 어긋났다: 전송을 갈아타면 협상값(HDR10)이 먼저 나가
+    /// 폰이 디코더를 PQ로 세우고, 뒤이은 `resizePipeline`은 w/h/codec만 비교해 조기반환하니
+    /// 여기가 아예 안 돌아 강등 통지가 사라졌다 — SDR 스트림을 PQ로 해석하는 색 틀어짐.
+    ///
+    /// 여기서만 보내면 그 어긋남이 구조적으로 불가능하다. 안 도는 경우엔 클라가 직전의
+    /// 확정값을 그대로 들고 있는데, 그때는 인코더도 그대로이므로 둘이 여전히 같다.
     private func confirmDynamicRange(_ np: NegotiatedParams, on vd: PeriVirtualDisplay) -> NegotiatedParams {
         mastering = nil
         hdrActive = false
-        guard np.wantsHDR else { return np }
+        // SDR 협상도 **알린다.** 지난 세션이 HDR이었을 수 있고, 클라는 마지막으로 들은 값을
+        // 계속 믿는다 — 안 알리면 그 값으로 디코더를 세운다.
+        guard np.wantsHDR else { sendSessionParams(np); return np }
 
         // 사용자가 껐으면 SDR로 간다. 디스플레이도 이미 SDR로 만들어져 있다
         // (leaseDisplay가 `spec.hdr && hdrEnabled`로 빌린다) — 여기서 스트림만 맞춰 준다.
@@ -718,6 +751,8 @@ final class ExtendService: ObservableObject, PeriApp {
         guard let ch = channel else { throw ExtendError.noChannel }
         let frameCounter = self.frameCounter
         let ltrMap = self.ltrMap
+        // 채널 **홀더**를 캡처한다 — 채널 자체가 아니라. 그 차이가 [ChannelBox]의 존재 이유다.
+        let channels = self.channelBox
         let meter = byteMeter
         let capturer = self.capturer        // 적응형 fps governor가 캡처 rate 라이브 조절
         let governor = fpsGovernor
@@ -744,7 +779,12 @@ final class ExtendService: ObservableObject, PeriApp {
                 }
             }
             // 영상 게이트: 최신성 경로가 열려 있어야 인코딩분을 흘려보낸다.
-            guard ch.isDatagramPathReady else { return }
+            //
+            // ★ 채널을 **캡처하지 않고 매번 묻는다.** 이 파이프라인은 세션보다 오래 살고
+            // (전송이 갈려도 기계가 일부러 유지한다), 채널은 세션과 함께 갈린다. 캡처하면
+            // 전환 뒤에도 죽은 옛 채널로 계속 쏘게 된다 — 실기기에서 LAN↔USB 양방향 모두
+            // 화면이 안 오던 원인이 정확히 이것이었다.
+            guard let ch = channels.channel, ch.isDatagramPathReady else { return }
             meter.add(frame.data.count)   // 측정 비트레이트용 바이트 누적
             let frameId = frameCounter.next()
             // 지연 계측 임베드: [ptsHostUs 8B BE][macSendUs 8B BE] + 비트스트림 (씰 안, 수신측이 스트립)
@@ -763,11 +803,27 @@ final class ExtendService: ObservableObject, PeriApp {
                 log.info("video sent frame=\(frameId) key=\(frame.keyframe) ltr=\(isLtr) frags=\(frags) bytes=\(frame.data.count) \(np.width)x\(np.height)")
             }
         }
-        // 주기 IDR 2초. 한때 0(off)으로 두고 LTR 복구에만 맡겼는데, 복구를 유발하는 신호가
-        // Android의 packet_seq 갭 감지 하나뿐이라 구멍이 있었다: 패킷은 다 왔는데 참조 프레임이
-        // 오염된 경우(디코더 오류, LTR 상태 꼬임)는 갭이 없어 감지되지 않고, 그러면 다음 IDR까지
-        // 최대 10분(안전망 간격) 동안 깨진 화면이 고착된다. 주기 IDR은 그 최악 지연을 2초로 묶는다.
-        try enc.start(bitrateKbps: np.bitrateKbps, fps: np.fps, keyframeIntervalSec: 2)
+        // 주기 IDR 30초 — **안전망일 뿐이다.**
+        //
+        // 한때 0(off)으로 두고 LTR 복구에만 맡겼다가 2초로 당겼었다. 이유는 복구를 유발하는
+        // 신호가 Android의 packet_seq 갭 하나뿐이라, 패킷은 다 왔는데 참조가 오염된 경우가
+        // 통째로 감지되지 않았기 때문이다. 지금은 수신측이 그 대부분을 스스로 지명한다:
+        //
+        //   · 디코더를 방금 세움(참조 0)    → `Need.idr`
+        //   · 디코드 오류(손상 비트스트림)   → 코덱 재구성 + `Need.idr`
+        //   · 코덱 내부 정지(출력 2초 없음)  → 코덱 재구성 + `Need.idr`
+        //   · 다이내믹 레인지 변경 재구성    → `Need.idr`
+        //   · 패킷·조각 손실                → `Need.refresh` (작은 LTR-P)
+        //
+        // 남는 건 **조용한 참조 오염** 하나다: 비트스트림이 유효하고 에러도 손실도 없는데
+        // 그림만 서서히 틀어지는 경우. 수신측에 탐지할 신호가 없어서 이것만은 주기 IDR로
+        // 덮어야 한다 — 그게 이 값이 0이 될 수 없는 유일한 이유다.
+        //
+        // 그래서 2초일 필요는 없다. 2초는 위 다섯을 못 잡던 시절의 대리 안전망이었고,
+        // 그 대가가 매 2초 188KB 버스트다(스트림에서 가장 큰 덩어리 → Wi-Fi 큐 포화 →
+        // RTT·영상 동반 펄싱). 안전망의 주기는 **사람이 견딜 수 있는 최악의 지속 시간**이면
+        // 충분하고, 30초면 버스트 비용이 1/15로 줄면서 그 상한을 지킨다.
+        try enc.start(bitrateKbps: np.bitrateKbps, fps: np.fps, keyframeIntervalSec: 30)
         // 새 파이프라인은 현재 전역 배율을 즉시 반영 (이미 포화 상태면 상한부터 시작하지 않도록).
         let startFps = max(30, min(np.fps, Int((Double(np.fps) * fpsGovernor.currentScale).rounded())))
         if startFps != np.fps { capturer.updateFrameRate(startFps); enc.setExpectedFrameRate(startFps) }
@@ -885,8 +941,33 @@ nonisolated struct ExtendInbox: Sendable {
     let bitrate: BitrateController
     let latency: LatencyBox
 
-    /// 손실 복구: 작은 LTR-P (ACK된 LTR이 없으면 IDR 폴백).
-    func onKeyframeRequest() { encoderBox.encoder?.forceLTRRefresh() }
+    /// 갱신 요청 — **무엇을 낼지는 상대가 정한다.**
+    ///
+    /// 이 갈래가 없던 시절이 실기기의 검은 화면이었다. 전부 `forceLTRRefresh()`로 보내면
+    /// ACK된 장기 참조를 가리키는 작은 LTR-P가 나가는데, **디코더를 방금 세운 쪽에는 참조
+    /// 프레임이 하나도 없다.** 아무리 받아도 못 풀어서 계속 버리고, 인코더가 우연히 IDR을
+    /// 낼 때까지 화면이 검다(로그에 3963ms · 111프레임).
+    ///
+    /// 그렇다고 전부 IDR로 되돌릴 수도 없다 — IDR은 스트림에서 가장 큰 버스트(188KB)라
+    /// Wi-Fi 큐를 포화시켜 RTT와 영상이 같이 펄싱한다. 그래서 **비싼 쪽은 정말 필요할 때만**
+    /// 내고, 그 판단은 디코더를 가진 쪽만 할 수 있다.
+    func onKeyframeRequest(_ need: PeriKeyframeRequest.Need, cause: PeriKeyframeRequest.Cause) {
+        guard let enc = encoderBox.encoder else {
+            log.debug("갱신 요청(\(String(describing: cause))) 무시 — 인코더 없음")
+            return
+        }
+        // ★ **원인과 대응을 한 줄에 같이 남긴다.** 갱신은 상대 화면이 검거나 멈췄을 때만
+        // 일어나므로 이 줄이 곧 그 순간의 진단이고, 두 기기의 로그를 맞춰 볼 필요가 없다.
+        switch need {
+        case .idr:
+            log.info("갱신 요청 → IDR (사유=\(String(describing: cause)))")
+            enc.requestKeyframe()
+        // 옛 피어는 이 필드를 안 보낸다 — 그때의 동작(LTR-P)을 그대로 준다.
+        case .refresh, .unspecified, .UNRECOGNIZED:
+            log.info("갱신 요청 → LTR-P (사유=\(String(describing: cause)))")
+            enc.forceLTRRefresh()
+        }
+    }
 
     func onLtrAck(frameId: UInt32) {
         if let token = ltrMap.take(frameId) { encoderBox.encoder?.acknowledgeLTR([token]) }
