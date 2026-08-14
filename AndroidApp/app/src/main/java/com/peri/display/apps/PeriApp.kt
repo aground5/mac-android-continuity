@@ -134,13 +134,11 @@ interface PeriApp {
      */
     fun onMediaGap() = Unit
 
-    /** 지금 켜져 있는가. UI 표시와 Mac 보고의 근거. */
-    val isRunning: Boolean
-
     /**
      * 지금 **영상을 나르고 있는가** — Wi-Fi 저지연 락과 keepalive 주기의 유일한 근거.
      *
-     * [isRunning]과 다르다: 알림 앱은 떠 있어도 라디오를 깨워 둘 이유가 없다.
+     * "켜져 있는가"와 다르다: 알림 앱은 떠 있어도 라디오를 깨워 둘 이유가 없다.
+     * 그래서 등록부가 묻는 것은 이 하나뿐이고, 켜짐 여부는 각 앱이 UI에 직접 비춘다.
      */
     val isStreaming: Boolean
 

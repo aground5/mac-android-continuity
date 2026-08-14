@@ -65,8 +65,7 @@ class LinkMetrics {
     private var fbHighSeq = -1
     private var fbRecv = 0
 
-    /** 한 번 보고할 만큼 모였는가. */
-    val hasWindow: Boolean get() = fbBaseSeq >= 0 && fbHighSeq >= 0 && fbRecv > 0
+    private val hasWindow: Boolean get() = fbBaseSeq >= 0 && fbHighSeq >= 0 && fbRecv > 0
 
     /** 진단 화면이 읽는 현재 윈도우(소비하지 않는다). */
     val received: Int get() = fbRecv

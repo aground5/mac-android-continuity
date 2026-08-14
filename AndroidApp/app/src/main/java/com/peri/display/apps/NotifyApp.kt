@@ -74,8 +74,6 @@ class NotifyApp(
         else NotifyEv.Quit(reason),
     )
 
-    override val isRunning: Boolean get() = runner.state.isRunning
-
     /** 알림은 영상을 나르지 않는다 — 라디오를 깨워 둘 이유가 없다. */
     override val isStreaming: Boolean get() = false
 

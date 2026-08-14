@@ -26,7 +26,6 @@ class ShareMachineTest {
         val step = reduceShare(linked(), ShareEv.Requested)
         assertEquals(Consent.ASKED, step.state.consent)
         assertTrue(ShareFx.AskConsent in step.fx)
-        assertEquals("화면 공유를 허용해 주세요", step.state.detail)
     }
 
     @Test

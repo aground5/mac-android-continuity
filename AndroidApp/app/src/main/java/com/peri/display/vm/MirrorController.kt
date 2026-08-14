@@ -14,7 +14,6 @@ import com.peri.display.DisplaySpec
 import com.peri.display.apps.AppHost
 import com.peri.display.apps.DetachReason
 import com.peri.display.apps.SessionChannel
-import com.peri.display.crypto.DATAGRAM_CHANNEL_ID_BYTES
 import com.peri.display.proto.Bye
 import com.peri.display.proto.ClientNetwork
 import com.peri.display.proto.ControlMessage
@@ -227,9 +226,6 @@ class MirrorController(context: Context) {
         private set
     var statusMessage by mutableStateOf("연결 안 됨")
         private set
-
-    /** 사용자가 '끊기'로 종료했는지 — UI의 AOA 자동 연결 루프가 재시도 중단 판단에 읽는다. */
-    val userClosed: Boolean get() = machine.intent !is Intent.Running
 
     /** 진단 화면이 상태를 다시 읽게 만드는 틱. 기계 전이·1초 통계마다 오른다. */
     var diagTick by mutableStateOf(0)
@@ -1014,7 +1010,7 @@ class MirrorController(context: Context) {
             val w = metrics.takeWindow() ?: return
             val span = (w.high - w.base + 1).coerceAtLeast(1)
             Log.d(TAG, "feedback qdelay=${st?.queueDelayMs ?: 0}ms " +
-                "buf=${st?.bufferMs ?: 0}ms recv=${w.received}/$span")
+                "buf=${apps.extend.bufferMs}ms recv=${w.received}/$span")
             b.setBaseSeq(w.base).setHighestSeq(w.high).setReceivedCount(w.received)
         }
         channel.sendReliable(
@@ -1043,11 +1039,6 @@ class MirrorController(context: Context) {
      */
     private fun onUdpOpen(open: UdpOpen) {
         val id = open.channelId.toByteArray()
-        // 길이부터 본다 — 되돌릴 id가 성한 값이어야 응답에 실을 수 있다.
-        if (id.size != DATAGRAM_CHANNEL_ID_BYTES) {
-            Log.e(TAG, "UdpOpen: 세대 id 길이가 ${id.size}B — 버린다")
-            return
-        }
         if (channel.reliableStream) {
             // 케이블로 붙어 있다 — 영상은 신뢰 파이프로 가므로 UDP를 열 이유가 없다.
             sendUdpAccept(id, ByteArray(0), "케이블(AOA)로 연결 중")

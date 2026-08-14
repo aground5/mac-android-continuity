@@ -36,12 +36,6 @@ data class ShareState(
     val linked: Boolean = false,
 ) {
     val isRunning: Boolean get() = consent == Consent.GRANTED
-
-    val detail: String? get() = when {
-        !linked -> null
-        consent == Consent.ASKED -> "화면 공유를 허용해 주세요"
-        else -> null
-    }
 }
 
 sealed interface ShareEv {

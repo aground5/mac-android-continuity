@@ -103,8 +103,6 @@ class ShareApp(
         if (!launch) runner.send(ShareEv.StopRequested(reason.ifEmpty { "Mac에서 종료" }))
     }
 
-    override val isRunning: Boolean get() = runner.state.isRunning
-
     override val isStreaming: Boolean get() = runner.state.isRunning
 
     override fun receive(msg: ControlMessage): Boolean {

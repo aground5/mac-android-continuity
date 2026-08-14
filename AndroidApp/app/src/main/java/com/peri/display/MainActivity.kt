@@ -162,7 +162,8 @@ private fun MirrorApp(initialSpec: DisplaySpec) {
     // AOA(USB) 자동 연결/전환 폴링 (USB 우선 정책): 액세서리가 붙어 있으면
     //  - 유휴/에러 → AOA 연결 (Mac 앱 재시작·타임아웃·끊김 모두 재플러그 없이 복구)
     //  - LAN 스트리밍 중 → AOA로 자동 전환 (판단은 controller.onAccessoryTick)
-    // '끊기'(userClosed)면 재시도 중단 — 재플러그나 앱 재실행으로 다시 활성화.
+    // 사용자가 '끊기'를 눌렀으면 재시도하지 않는다 — 그 판단은 `onAccessoryTick`이
+    // 상태 기계에 물어서 한다(여기서 플래그를 들고 있지 않는다).
     val latestSpec by rememberUpdatedState(currentSpec)
 
     // 액세서리 권한 부여 브로드캐스트 → 즉시 연결 시도(다음 폴링 틱까지 기다리지 않음).

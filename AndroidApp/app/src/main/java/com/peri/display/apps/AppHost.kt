@@ -3,7 +3,6 @@ package com.peri.display.apps
 import android.content.Context
 import android.util.Log
 import com.peri.display.proto.AppControl
-import com.peri.display.proto.AppId
 import com.peri.display.proto.ControlMessage
 import kotlinx.coroutines.CoroutineScope
 
@@ -93,7 +92,4 @@ class AppHost(scope: CoroutineScope, context: Context, channel: AppChannel) {
     fun mediaGap() {
         for (app in apps) app.onMediaGap()
     }
-
-    /** 진단·UI가 쓰는 조회. */
-    fun app(id: AppId): PeriApp? = apps.firstOrNull { it.id == id }
 }

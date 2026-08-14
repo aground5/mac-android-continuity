@@ -122,8 +122,6 @@ class ExtendApp(
     override fun control(launch: Boolean, reason: String) =
         runner.send(if (launch) ExtendEv.Launched else ExtendEv.Quit(reason))
 
-    override val isRunning: Boolean get() = runner.state.isRunning
-
     /** 확장이 켜져 있으면 곧 영상이 흐른다 — 저지연이 실제로 필요한 경우다. */
     override val isStreaming: Boolean get() = runner.state.isRunning
 
@@ -313,11 +311,14 @@ class ExtendApp(
         decoder?.let { it.clockOffsetUs = offsetUs; it.clockSynced = synced }
     }
 
-    /** 진단 화면이 읽는 원시 수치. 디코더가 없으면 null. */
+    /**
+     * 디코더가 **잰** 수치. 디코더가 없으면 null.
+     *
+     * 우리가 설정한 값(버퍼 깊이·즉시렌더)은 여기 없다 — 그건 디코더가 없어도 답할 수
+     * 있는 값이라 따로 노출한다. 섞어 두면 "디코더가 없으니 버퍼도 모른다"가 된다.
+     */
     fun stats(): Stats? = decoder?.let {
         Stats(
-            bufferMs = playoutBufferMs,
-            renderOnArrival = renderOnArrivalPref ?: ch.reliableStream,
             queueDelayMs = it.queueDelayMs,
             pipeNetMs = it.pipeNetMs,
             pipeJbufMs = it.pipeJbufMs,
@@ -326,8 +327,6 @@ class ExtendApp(
     }
 
     data class Stats(
-        val bufferMs: Int,
-        val renderOnArrival: Boolean,
         val queueDelayMs: Int,
         val pipeNetMs: Int,
         val pipeJbufMs: Int,
