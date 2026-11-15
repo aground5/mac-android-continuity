@@ -3,6 +3,7 @@ package com.peri.display.decode
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import com.peri.display.CodecSupport
@@ -285,6 +286,24 @@ class VideoDecoder(private val surface: Surface) {
 
         // 실제 해상도는 SPS에서 디코더가 읽어 INFO_OUTPUT_FORMAT_CHANGED로 보정한다.
         val format = MediaFormat.createVideoFormat(mime, 1280, 720)
+
+        // ── 이건 파일 재생이 아니라 실시간 스트림이다 ────────────────────────────
+        //
+        // 하드웨어 디코더는 기본적으로 **파일 재생**을 가정하고 클럭·버퍼를 잡는다. 그러면
+        // 우리처럼 프레임이 띄엄띄엄 들어오는 스트림은 "한가한 작업"으로 읽혀 낮은 동작점에
+        // 머물고, 디코딩 시간이 몇 ms에서 수십 ms로 튄다. 엑시노스에서 널리 보고된
+        // 증상이고(스트리밍 중 화면 녹화를 켜면 코덱이 풀가동되며 지연이 뚝 떨어진다는
+        // 그 이야기), 우리 쪽에서 말할 수 있는 건 아래 두 마디다.
+        //
+        // 인코더에 건 것과 짝이다 — 굽는 쪽만 실시간이라고 말하고 푸는 쪽은 안 말하면
+        // 파이프라인의 절반만 실시간이 된다.
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0)   // 0 = 실시간 (자원·동작점 계획에 반영)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // ★ 인코더에는 못 걸고 **디코더에만** 걸 수 있는 키다(SDK 문서: "applies only to
+            // decoders"). 표준이 요구하는 것 이상으로 입출력을 붙들지 말라는 뜻이라,
+            // 재생기용 선행 버퍼링이 그대로 지연이 되는 우리 경로에 정확히 맞는다.
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
 
         if (mime == MediaFormat.MIMETYPE_VIDEO_AVC) {
             val sps = nals.firstOrNull { nalType(it, false) == 7 }

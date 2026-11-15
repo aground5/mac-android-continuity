@@ -64,22 +64,27 @@ private const val IDLE_PING_MS = 5000L
 private const val DEAD_AFTER_PERIODS = 3
 
 /**
- * 영상 앱이 떠 있는데 데이터그램이 이만큼 안 오면 **경로가 어긋난 것으로 보고 재등록한다.**
+ * 영상 앱이 떠 있는데 데이터그램이 이만큼 안 오면 **PING으로 경로 생사를 확인한다.**
  *
  * 짧게 잡을 수 없다: 키프레임 간격과 일시적 혼잡을 굶주림으로 오해하면 멀쩡한 스트림에
- * HELLO를 계속 쏘게 된다. 길게도 못 잡는다 — 이 값이 곧 **화면이 얼어 있는 시간**이다.
+ * PING을 계속 쏘게 된다. 길게도 못 잡는다 — 이 값이 곧 **화면이 얼어 있는 시간**이다.
  * 2초면 사람이 "끊겼나?" 하기 직전이고, 30fps 기준 60프레임이라 정상 흐름에서는 절대
  * 닿지 않는다.
+ *
+ * ★ 여기 걸리는 게 늘 "경로가 죽었다"는 뜻은 아니다 — 화면이 그냥 안 바뀌어서(가려짐·정지
+ * 화면) Mac이 보낼 프레임이 없는 경우가 흔하다. 그 둘을 가르는 게 PONG이다: PING을 쏘고
+ * PONG이 빨리 돌아오면 경로는 멀쩡한 것이고, 그때는 재등록도 재협상도 필요 없다.
  */
 private const val VIDEO_STARVED_MS = 2000L
 
 /**
- * 재등록을 이만큼 해 보고도 영상이 없으면 **전제가 틀린 것**으로 보고 라운드를 다시 돈다.
+ * PING을 이만큼 보내 보고도 PONG이 없으면 **전제가 틀린 것**으로 보고 라운드를 다시 돈다.
  *
- * 재등록이 고치는 건 "교체 직후 쏜 HELLO 한 발이 유실됐다" 하나뿐이고, 그건 한두 번이면
- * 닿는다. 그 이상은 세대가 갈렸거나 구멍이 닫힌 것이라 같은 HELLO를 아무리 반복해도 안 된다.
+ * PING이 고치는 건 "교체 직후 쏜 HELLO 한 발이 유실됐다" 하나뿐이고(PING은 HELLO와 같은
+ * 모양이라 Mac 쪽에서 피어를 재등록한다), 그건 한두 번이면 닿는다. 그 이상 답이 없으면
+ * 세대가 갈렸거나 구멍이 닫힌 것이라 같은 PING을 아무리 반복해도 안 된다.
  */
-private const val MAX_HELLO_RETRIES = 2
+private const val MAX_PING_RETRIES = 2
 
 /**
  * **세션 오케스트레이터.** 전송을 붙이고, 키를 세우고, 프레임을 임자에게 넘긴다.
@@ -227,6 +232,17 @@ class MirrorController(context: Context) {
     var statusMessage by mutableStateOf("연결 안 됨")
         private set
 
+    /**
+     * **세션은 살아 있는데 경로를 다시 놓는 중**인가 — UI가 페어링 화면으로 돌아가지 않을 근거.
+     *
+     * [state]만 보면 재협상 때마다 `STREAMING`이 잠깐 벗겨져서, 화면이 통째로 설정 화면으로
+     * 돌아갔다가 1~2초 뒤 다시 영상으로 돌아온다. 실기기에서 90초에 여섯 번 그랬다.
+     * 그런데 그 사이 **상대도 세션도 그대로다** — 바뀐 건 어느 선으로 가느냐뿐이다.
+     * 기계는 그 둘을 이미 갈라 들고 있으므로(`sess` / `path`) 여기서 그대로 내준다.
+     */
+    var reconnecting by mutableStateOf(false)
+        private set
+
     /** 진단 화면이 상태를 다시 읽게 만드는 틱. 기계 전이·1초 통계마다 오른다. */
     var diagTick by mutableStateOf(0)
         private set
@@ -347,7 +363,11 @@ class MirrorController(context: Context) {
         val m = machine
         // `diagTick`은 진단 화면이 스냅샷을 다시 읽게 만드는 신호다. 축만 바뀌고 `conn`·`status`가
         // 그대로인 전이도 있어서(예: nego 갈래), 그것만으로는 화면이 낡은 값을 붙들고 있다.
-        scope.launch(Dispatchers.Main) { state = m.conn; statusMessage = m.status; diagTick++ }
+        // 상대를 아직 알고 있는데 STREAMING이 아니다 = 선을 다시 놓는 중이지 끊긴 게 아니다.
+        val rebuilding = m.sess is Sess.Live && m.conn != ConnState.STREAMING
+        scope.launch(Dispatchers.Main) {
+            state = m.conn; statusMessage = m.status; reconnecting = rebuilding; diagTick++
+        }
     }
 
     private fun runFx(fx: Fx) {
@@ -361,6 +381,7 @@ class MirrorController(context: Context) {
             // 여기서 하는 일은 "말할 채널이 생겼다"를 알리는 것뿐이고, 무엇을 세울지는
             // 앱마다 다르다(확장은 디코더, 공유는 동의 재요청 대기, 알림은 권한 재확인).
             Fx.AttachApps -> apps.attach()
+            Fx.ResetDecoder -> apps.extend.restart("새 세션")
             Fx.StopKeepalive -> { keepaliveJob?.cancel(); keepaliveJob = null }
             Fx.CloseTransport -> bearer.disconnect()
             Fx.SendBye -> sendBye(pendingByeReason)
@@ -426,7 +447,8 @@ class MirrorController(context: Context) {
     }
 
     private fun reconnectNow() {
-        apps.extend.restart("재접속")
+        // 디코더는 건드리지 않는다 — 이 시도가 실패해도 화면은 살아 있어야 한다.
+        // 다시 세우는 건 세션이 실제로 선 뒤다([Fx.ResetDecoder]).
         client.connect(host, port)
     }
 
@@ -474,6 +496,7 @@ class MirrorController(context: Context) {
     init {
         wireBearer(client)
         client.onVideoPacket = { pkt -> onVideoPacket(pkt) }   // LAN UDP 영상 (AOA는 WireFrame.Video)
+        client.onUdpPong = { nonce, body -> onUdpPong(nonce, body) }
         netWatcher.onChanged = { _, reason -> onNetworkChanged(reason) }
         netWatcher.start()
         apps.onChanged = { appsChanged() }
@@ -576,8 +599,9 @@ class MirrorController(context: Context) {
         bearer = client
         paths.coldPunch(
             remote = remote,
-            // 연결 직전에 디코더를 **새로** 세운다 — 확장이 살아남은 경로에서만 실제로 선다.
-            prepareDecoder = { scope.launch { apps.extend.restart("경로 재수립") } },
+            // 디코더는 여기서 손대지 않는다. 펀칭이 실패할 수 있고, 실패한 시도 때문에
+            // 멀쩡한 화면을 잃을 이유가 없다 — 세션이 서면 [Fx.ResetDecoder]가 세운다.
+            prepareDecoder = {},
             epochOpen = { crypto.hasEpoch },
             sendHello = ::sendUdpHello,
             done = { ok, note -> dispatch(Ev.NegoDone(ok, note)) },
@@ -619,7 +643,6 @@ class MirrorController(context: Context) {
         sts.expectedPeer = null
         dispatch(Ev.StartConnect(Via.LAN))
         bearer = client
-        apps.extend.restart("연결 시작")
         client.connect(host, port)
     }
 
@@ -669,7 +692,6 @@ class MirrorController(context: Context) {
         // 앞선 BLE 라운드의 기대를 물려받으면 그 부트스트랩이 통째로 막힌다.
         sts.expectedPeer = null
         dispatch(Ev.StartConnect(Via.AOA))
-        apps.extend.restart("USB 연결")
         a.open(accessory)
         // (제거됨) AOA 전용 8초 핸드셰이크 타임아웃. 같은 마감이 이제 [Fx.ArmHandshakeWatchdog]로
         // LAN·AOA 공통이다. 다만 fd가 열리기만 하고 `onConnected`조차 안 오면 그 워치독은
@@ -906,75 +928,105 @@ class MirrorController(context: Context) {
         }
     }
 
-    /** 마지막으로 HELLO를 다시 보낸 시각 — 굶주림이 이어져도 초당 한 발을 넘기지 않는다. */
-    private var lastHelloRetryAt = 0L
+    /** 마지막으로 PING을 다시 보낸 시각 — 굶주림이 이어져도 초당 한 발을 넘기지 않는다. */
+    private var lastPingRetryAt = 0L
 
-    /** 이 굶주림 구간에서 재등록을 몇 번 시도했나. 프레임이 오면 0으로 돌아간다. */
-    private var helloRetries = 0
+    /** 이 굶주림 구간에서 생사 확인 PING을 몇 번 보냈나. 프레임이나 PONG이 오면 0으로 돌아간다. */
+    private var pingRetries = 0
 
     /**
-     * **영상이 흐르기로 되어 있는데 한 장도 안 온다** — 경로를 다시 등록한다.
+     * **영상이 흐르기로 되어 있는데 한 장도 안 온다** — 경로가 살아 있는지 PING/PONG으로
+     * 직접 확인한다.
      *
      * 이 감시가 없으면 그 상태를 알아챌 방법이 아예 없다. 영상 경로의 복구 수단이 전부
      * **도착한 패킷**을 방아쇠로 삼기 때문이다: 손실 감지도, 갱신 요청도 패킷이 와야 운다.
      * 한 장도 안 오면 아무것도 울리지 않고, 제어 채널은 TCP라 멀쩡하니 keepalive도 조용하다.
      * 화면만 마지막 프레임에 얼어붙는다 — 실기기에서 망 전환 뒤에 정확히 그랬다.
      *
-     * 왜 HELLO인가: Mac은 **HELLO의 출발지 주소로** 영상 피어를 링크한다. 망이 갈리면 그
-     * 주소가 바뀌는데, 교체 직후 보내는 HELLO는 UDP 한 발이라 재전송이 없다 — 하필 가장
-     * 잃기 쉬운 순간에 한 번만 쏘고 만다. 그게 유실되면 Mac은 죽은 주소로 계속 보낸다.
+     * ★ 영상이 없다고 곧장 재협상을 청하지 않는다. 화면이 안 바뀌어 Mac이 보낼 프레임이
+     * 없는 것뿐일 수도 있다(가려짐·정지 화면) — 그건 정상이고 고칠 것이 없다. PING을 쏘고
+     * PONG이 돌아오면 그 경우다: [onUdpPong]이 처리하고 여기는 조용히 물러난다.
+     *
+     * 왜 PING이 HELLO를 겸하는가: Mac은 **HELLO(=PING)의 출발지 주소로** 영상 피어를
+     * 링크한다. 망이 갈리면 그 주소가 바뀌는데, 교체 직후 보내는 최초 HELLO는 UDP 한 발이라
+     * 재전송이 없다 — 하필 가장 잃기 쉬운 순간에 한 번만 쏘고 만다. 그게 유실되면 Mac은
+     * 죽은 주소로 계속 보낸다. PING이 같은 모양이라 재전송 겸 재등록이 되고, 덤으로 PONG이
+     * 오는지로 이번엔 진짜 닿았는지까지 안다.
      *
      * 세션도 세대도 건드리지 않는다. **등록만 다시 한다** — 경로가 진짜로 죽었으면 그건
-     * keepalive와 재협상의 몫이고, 여기서 판단할 일이 아니다.
+     * PONG 부재가 잡아내고, 그 판단은 [escalate]가 한다.
      */
     private fun watchDatagramPath() {
         if (!apps.streaming || !crypto.hasEpoch) return
-        // 케이블은 세대도 HELLO도 없다 — 영상이 제어와 같은 신뢰 파이프로 온다.
+        // 케이블은 세대도 PING도 없다 — 영상이 제어와 같은 신뢰 파이프로 온다.
         if (channel.reliableStream) return
-        // 이미 새 경로를 찾는 중이면 기다린다. 라운드가 도는 동안 HELLO를 쏴 봐야 옛
+        // 이미 새 경로를 찾는 중이면 기다린다. 라운드가 도는 동안 PING을 쏴 봐야 옛
         // 소켓에서 나가고, 재협상을 또 청하면 예약만 쌓인다.
         if (machine.negoBusy) return
         val since = metrics.sinceVideoMs
         if (since in 0 until VIDEO_STARVED_MS) {
-            helloRetries = 0   // 영상이 흐른다 — 다음 굶주림은 처음부터 센다
+            pingRetries = 0   // 영상이 흐른다 — 다음 굶주림은 처음부터 센다
+            return
+        }
+
+        // ★ 영상은 없어도 PONG이 최근에 왔으면 경로는 멀쩡하다 — 그냥 화면이 안 바뀌어
+        // 보낼 프레임이 없을 뿐이다. 여기서 조용히 물러나는 게 핵심이다: 예전엔 이 상태를
+        // 구분 못 해 2초마다 "재등록"을 무한히 찍었다(실기기에서 겪음, 진짜 원인은 화면
+        // 정지였는데 로그는 계속 재접속하는 것처럼 보였다).
+        val sincePong = metrics.sinceUdpPongMs
+        if (sincePong in 0 until VIDEO_STARVED_MS) {
+            pingRetries = 0
             return
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastHelloRetryAt < VIDEO_STARVED_MS) return
-        lastHelloRetryAt = now
+        if (now - lastPingRetryAt < VIDEO_STARVED_MS) return
+        lastPingRetryAt = now
 
         // ★ 보낼 주소가 아예 없다 = 경로 교체가 UDP를 못 옮겼다(상대 후보에 UDP가 없었다).
         //
-        // 이때 HELLO를 쏘면 `udpTarget`이 없어 **제어 채널 주소로** 나간다 — Mac의 UDP
+        // 이때 PING을 쏘면 `udpTarget`이 없어 **제어 채널 주소로** 나간다 — Mac의 UDP
         // 소켓에 닿지 않으니 영원히 무의미하다. 필요한 건 등록이 아니라 새 구멍이다.
         if (client.udpTarget == null) {
             escalate("영상 경로에 보낼 주소가 없다")
             return
         }
 
-        // ★ **재등록은 몇 번만 해 보고 포기한다.**
+        // ★ **PING은 몇 번만 해 보고 포기한다.**
         //
-        // HELLO 재전송이 고치는 건 딱 하나다: 교체 직후 한 발 쏜 HELLO가 유실돼 Mac이 옛
-        // 주소로 보내고 있는 경우. 그건 한두 번이면 닿는다. 그런데도 안 오면 전제가 틀린
-        // 것이다 — 세대가 갈렸거나, 구멍이 닫혔거나, 애초에 잘못된 주소로 쏘고 있다.
-        // 그때 같은 HELLO를 영원히 반복하는 건 복구가 아니라 그냥 로그 낭비다(실기기에서
-        // 2초마다 같은 줄이 무한히 찍혔다). 라운드를 다시 도는 것만이 그 셋을 다 고친다.
-        helloRetries++
-        if (helloRetries > MAX_HELLO_RETRIES) {
-            escalate("HELLO를 ${MAX_HELLO_RETRIES}번 보냈는데 영상이 없다")
+        // PING 재전송이 고치는 건 딱 하나다: 교체 직후 한 발 쏜 HELLO가 유실돼 Mac이 옛
+        // 주소로 보내고 있는 경우. 그건 한두 번이면 PONG이 돌아온다. 그런데도 안 오면
+        // 전제가 틀린 것이다 — 세대가 갈렸거나, 구멍이 닫혔거나, 애초에 잘못된 주소로
+        // 쏘고 있다. 그때 같은 PING을 영원히 반복하는 건 복구가 아니라 그냥 로그 낭비다.
+        // 라운드를 다시 도는 것만이 그 셋을 다 고친다.
+        pingRetries++
+        if (pingRetries > MAX_PING_RETRIES) {
+            escalate("PING을 ${MAX_PING_RETRIES}번 보냈는데 응답이 없다")
             return
         }
         lifecycle(
             (if (since < 0) "영상 앱이 떴는데 첫 프레임이 없다" else "영상이 ${since}ms째 없다") +
-                " — 경로 재등록 $helloRetries/$MAX_HELLO_RETRIES (Mac이 옛 주소로 보내는 중일 수 있다)"
+                " — 경로 생사 확인 PING $pingRetries/$MAX_PING_RETRIES"
         )
-        sendUdpHello()
+        sendUdpPing()
     }
 
-    /** 재등록으로는 안 되는 상황 — 라운드를 통째로 다시 돈다. */
+    /**
+     * PONG 하나 도착 — [SessionCrypto.openPong]으로 지금 세대의 것인지 검증한다.
+     *
+     * 여기서 하는 일은 "경로가 살아 있다"는 사실을 [LinkMetrics]에 적는 것뿐이다. 그 사실을
+     * 어떻게 쓸지(재등록을 멈출지, 계속 기다릴지)는 다음 [watchDatagramPath] 호출이 정한다 —
+     * 콜백 스레드에서 상태 기계를 건드리지 않기 위해서다.
+     */
+    private fun onUdpPong(nonce: ByteArray, body: ByteArray) {
+        if (!crypto.openPong(nonce, body)) return
+        metrics.noteUdpPong()
+        pingRetries = 0
+    }
+
+    /** PING/PONG으로는 안 되는 상황 — 라운드를 통째로 다시 돈다. */
     private fun escalate(why: String) {
-        helloRetries = 0
+        pingRetries = 0
         lifecycle("$why — 재협상으로 UDP를 다시 뚫는다 (세대 ${epochHex()}, 대상 ${client.udpTarget})")
         dispatch(Ev.NegoNeeded("영상 경로 없음"))
     }
@@ -1105,7 +1157,7 @@ class MirrorController(context: Context) {
         if (crypto.channelId == null) return
         lifecycle("데이터그램 세대 닫음 (${epochHex()}, $reason)")
         crypto.closeEpoch()
-        helloRetries = 0
+        pingRetries = 0
         client.onUdpProbe = null
         client.releaseMediaSocket()
         resetMediaReceive()   // 다음 세대의 조각·순번과 섞이면 안 된다
@@ -1120,6 +1172,20 @@ class MirrorController(context: Context) {
         // 안 닿는다"가 곧바로 갈린다 — 그 둘의 원인은 완전히 다른 곳에 있다.
         lifecycle("영상 경로 등록 HELLO — 세대 ${epochHex()}")
         client.startVideo(hello)
+    }
+
+    /**
+     * 경로 생사 확인 PING. 와이어 모양은 HELLO와 같지만(피어 재등록 겸용) **PONG을
+     * 기대한다는 점이 다르다** — [watchDatagramPath]가 응답 여부로 재협상 여부를 정한다.
+     *
+     * `startVideo`가 아니라 `sendVideo`로 보낸다: 여기 오는 시점엔 이미 UDP 수신 루프가
+     * 떠 있다(최초 세대 개시가 항상 먼저 지나갔다 — `apps.streaming && crypto.hasEpoch`가
+     * 그걸 보장한다). `startVideo`를 다시 부르면 수신 루프를 또 여는 불필요한 일이 된다.
+     */
+    private fun sendUdpPing() {
+        if (channel.reliableStream) return
+        val ping = crypto.pingDatagram() ?: return
+        client.sendVideo(ping)
     }
 
     private fun epochHex(): String =

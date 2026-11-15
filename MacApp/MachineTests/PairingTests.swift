@@ -135,7 +135,7 @@ func testPinPeerOnlyAfterPake() {
         .startScan, .stopScan, .connectRequested(sts: false), .connectRequested(sts: true),
         .linkReady, .linkLost, .stsHelloReceived, .stsConfirmed,
         .offerReceived, .pinSubmitted("4821"), .pakeAccepted, .peerIdentity,
-        .peerAborted("x"), .remoteCandidates, .deadlineElapsed, .failed("x"),
+        .peerAborted("x"), .remoteCandidates, .deadlineElapsed, .roundFinished, .failed("x"),
     ]
     // `identifying` 이전의 어떤 단계에서도 어떤 사건으로도 핀이 나오면 안 된다.
     let before: [PairState] = [

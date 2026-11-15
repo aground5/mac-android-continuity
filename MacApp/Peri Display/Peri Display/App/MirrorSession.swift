@@ -436,6 +436,16 @@ final class Session: ObservableObject, Identifiable {
     /// 이 UDP 피어가 지금 이 세션의 것인가 — 매니저가 수신 영상을 디먹스하는 근거.
     nonisolated func ownsUdpPeer(_ id: LanServer.UDPPeerID) -> Bool { udpPeerBox.value == id }
 
+    /// PING에 대한 답. 지금 세대 id를 봉인해 돌려보낸다 — Android는 그걸 열어 자기 세대와
+    /// 대조해 "이 PONG이 지금 세대의 것인가"까지 확인한다(늦게 온 지난 세대의 PONG 방지).
+    ///
+    /// 매니저(`onUdpPing`)가 [linkUdp]로 피어를 이미 재등록한 **뒤에** 부른다 — 그래야
+    /// 망 전환으로 주소가 바뀐 첫 PING에도 답이 새 주소로 나간다.
+    nonisolated func replyPong(to peerID: LanServer.UDPPeerID) {
+        guard let d = datagramBox.value, let sealed = try? d.keys.sender.seal(d.id) else { return }
+        server.sendVideo(WireFormat.pongDatagram(nonce: sealed.nonce, body: sealed.body), to: peerID)
+    }
+
     /// 손실 허용 경로로 온 영상 조각 하나. **LAN 큐에서 동기로** 불린다.
     ///
     /// 조각이 다 모여야 봉인이 풀리므로 대부분의 호출은 아무 일도 하지 않고 돌아간다 —
@@ -979,6 +989,11 @@ final class SessionManager: ObservableObject {
     /// AppCore가 `aoa.forget(_:)`으로 배선한다.
     var onSessionReleased: ((Session) -> Void)?
 
+    /// 제어 채널이 실제로 살아났다(`sessionLive`/`pathSwapped`가 `startLiveness`를 낸 바로 그
+    /// 순간) — BLE 페어링 라운드가 이 신호를 기다리며 창을 붙들고 있었다면 이제 끝내도 된다.
+    /// AppCore가 `pairing.finishRound()`로 배선한다.
+    var onSessionEstablished: (() -> Void)?
+
     // MARK: - 로그 형식
     //
     // Android와 **같은 문법**을 쓴다:  `[dev:<지문8>][r:<라운드>] 사건 → 상태 (축…)`
@@ -1093,6 +1108,7 @@ final class SessionManager: ObservableObject {
 
         case .startLiveness:
             dev.session?.setLivenessEnabled(true)
+            onSessionEstablished?()
 
         case .stopLiveness:
             dev.session?.setLivenessEnabled(false)
@@ -1342,6 +1358,24 @@ final class SessionManager: ObservableObject {
                 udp HELLO: 맞는 세대 없음 — 들어온 id=\(Self.hex(h.channel)), \
                 열려 있는 세대=[\(open.joined(separator: ", "))]
                 """)
+        }
+        // UDP PING → HELLO와 같은 매칭(피어 재등록) 뒤에 PONG으로 답한다.
+        //
+        // Android의 "영상이 안 온다" 감시가 재협상을 청하기 전에 마지막으로 두드려 보는
+        // 자리다. 맞는 세대가 없으면(세대가 갈렸거나 이미 닫혔다) 조용히 무시한다 — PONG이
+        // 안 오는 것 자체가 Android에게는 "재협상이 필요하다"는 신호다.
+        server.onUdpPing = { [weak self] peerID, rest in
+            guard let self else { return }
+            guard let h = WireFormat.parseUdpHello(rest) else {
+                log.error("udp PING: 형식 오류 (\(rest.count)B)")
+                return
+            }
+            for s in self.router.all()
+            where s.acceptsHello(channel: h.channel, nonce: h.nonce, body: h.body) {
+                s.linkUdp(peerID)
+                s.replyPong(to: peerID)
+                return
+            }
         }
         // UDP 영상(화면 공유) → 그 피어를 가진 세션. HELLO가 이미 주소↔세션을 묶어 놨으므로
         // 여기선 조회 한 번이면 된다 — 프레임마다 시도복호화를 돌릴 이유가 없다.

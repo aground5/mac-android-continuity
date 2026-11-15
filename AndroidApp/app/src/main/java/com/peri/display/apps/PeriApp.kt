@@ -41,6 +41,14 @@ data class MediaMeta(
     val timestampMs: Long,
     val keyframe: Boolean,
     val hevc: Boolean,
+    /**
+     * 이 프레임이 **장기 참조 앵커**인가.
+     *
+     * 받는 쪽이 이 비트를 보고 ACK을 돌려주면, 보낸 쪽은 그 지점을 손실 복구의 되돌아갈
+     * 자리로 삼는다. 손실이 구조적으로 없는 신뢰 파이프(AOA)에서는 의미가 없어 헤더에
+     * 자리조차 없다 — 그래서 최신성 레인에서만 실려 나간다.
+     */
+    val isLtr: Boolean = false,
 )
 
 /**

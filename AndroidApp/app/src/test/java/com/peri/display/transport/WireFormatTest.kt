@@ -74,6 +74,48 @@ class WireFormatTest {
         assertArrayEquals(body, d.copyOfRange(17 + NONCE_LEN, d.size))
     }
 
+    @Test
+    fun `PING 데이터그램은 HELLO와 같은 모양이고 타입만 다르다`() {
+        val id = ByteArray(16) { it.toByte() }
+        val nonce = ByteArray(NONCE_LEN) { (0x40 + it).toByte() }
+        val body = byteArrayOf(1, 2, 3)
+        val d = WireFormat.udpPingDatagram(id, nonce, body)
+
+        assertEquals(UdpType.PING.raw, d[0].toInt())
+        assertArrayEquals(id, d.copyOfRange(1, 17))
+        assertArrayEquals(nonce, d.copyOfRange(17, 17 + NONCE_LEN))
+        assertArrayEquals(body, d.copyOfRange(17 + NONCE_LEN, d.size))
+    }
+
+    @Test
+    fun `PONG 파싱은 타입·nonce·본문을 되돌린다`() {
+        val nonce = ByteArray(NONCE_LEN) { (0x10 + it).toByte() }
+        val body = ByteArray(17) { (it + 1).toByte() }   // 최소 태그(16B)보다 한 바이트 많게
+        val d = ByteArray(1 + NONCE_LEN + body.size)
+        d[0] = UdpType.PONG.raw.toByte()
+        nonce.copyInto(d, 1)
+        body.copyInto(d, 1 + NONCE_LEN)
+
+        val parsed = WireFormat.parseUdpPong(d, d.size)!!
+        assertArrayEquals(nonce, parsed.first)
+        assertArrayEquals(body, parsed.second)
+    }
+
+    @Test
+    fun `PONG 파싱은 다른 타입이나 짧은 길이를 거절한다`() {
+        val nonce = ByteArray(NONCE_LEN)
+        val body = byteArrayOf(1)   // 태그(16B) 없이 너무 짧다
+        val short = ByteArray(1 + NONCE_LEN + body.size)
+        short[0] = UdpType.PONG.raw.toByte()
+        nonce.copyInto(short, 1)
+        body.copyInto(short, 1 + NONCE_LEN)
+        assertNull(WireFormat.parseUdpPong(short, short.size))
+
+        val wrongType = ByteArray(1 + NONCE_LEN + 16)
+        wrongType[0] = UdpType.VIDEO.raw.toByte()
+        assertNull(WireFormat.parseUdpPong(wrongType, wrongType.size))
+    }
+
     // MARK: 타입 조회
 
     @Test
@@ -82,7 +124,8 @@ class WireFormatTest {
         for (t in UdpType.entries) assertEquals(t, UdpType.from(t.raw))
         assertNull(WireType.from(99))
         assertNull(WireType.from(-1))     // 표 인덱싱이 음수에서 터지지 않아야 한다
-        assertNull(UdpType.from(2))       // ICE 프로브 타입 — 영상 파서가 물러나는 근거
+        assertNull(UdpType.from(2))       // ICE 프로브 타입(PROBE) — 영상 파서가 물러나는 근거
+        assertNull(UdpType.from(3))       // ICE 프로브 타입(PROBE_ACK) — 위와 같은 이유
     }
 
     // MARK: 재조립 — 어떻게 쪼개져 와도 결과가 같아야 한다
@@ -225,7 +268,7 @@ class WireFormatTest {
         val body = ByteArray(50) { (it + 1).toByte() }
         val packets = WireFormat.packetizeVideo(
             frameId = 9, keyframe = true, payloadType = 1, timestampMs = 77,
-            body = body, nextPacketSeq = { 5 },
+            body = body, isLtr = false, nextPacketSeq = { 5 },
         )
         assertEquals(1, packets.size)
 

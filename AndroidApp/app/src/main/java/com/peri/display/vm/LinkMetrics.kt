@@ -86,6 +86,29 @@ class LinkMetrics {
         lastPacketSeq = -1
         lastPacketAt = 0L
         fbBaseSeq = -1; fbHighSeq = -1; fbRecv = 0
+        lastUdpPongAt = 0L
+    }
+
+    // MARK: - UDP 경로 생사 (PING/PONG)
+
+    /**
+     * 마지막 UDP PONG 도착 시각(ms). 0 = 이 세대에서 아직 못 받음.
+     *
+     * [lastPacketAt]과 갈라 둔 이유: 영상 패킷의 부재는 "안 온다"는 사실만 말할 뿐 **왜**
+     * 안 오는지는 말하지 않는다(보낼 게 없어서 vs 경로가 죽어서). PONG은 그 둘을 가르는
+     * 유일한 능동 신호다 — Mac이 응답했다는 건 우리 PING이 그쪽에 닿았고 그 답이 돌아왔다는
+     * 뜻이라, 경로 자체의 생사를 영상 유무와 독립적으로 확인한다.
+     */
+    @Volatile
+    var lastUdpPongAt = 0L
+        private set
+
+    /** 마지막 UDP PONG 이후 경과(ms). -1 = 이 세대에서 아직 못 받음. */
+    val sinceUdpPongMs: Long
+        get() = if (lastUdpPongAt == 0L) -1 else System.currentTimeMillis() - lastUdpPongAt
+
+    fun noteUdpPong() {
+        lastUdpPongAt = System.currentTimeMillis()
     }
 
     // MARK: - 왕복과 클럭

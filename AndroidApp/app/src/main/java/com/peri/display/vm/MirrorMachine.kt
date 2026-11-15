@@ -255,6 +255,14 @@ sealed interface Fx {
      * 없어 검은 화면이 됐다. 세션 확립·무손실 재개 둘 다 여기를 지난다.
      */
     data object AttachApps : Fx
+
+    /**
+     * 새 세션이 섰다 — 영상 디코더를 다시 세운다.
+     *
+     * [AttachApps]와 갈라 둔 이유: 경로만 갈리는 무손실 전환에서도 앱은 다시 붙지만
+     * 디코더는 **그대로 두어야 한다**. 둘을 한 효과로 묶으면 그 구분이 사라진다.
+     */
+    data object ResetDecoder : Fx
     data object CloseTransport : Fx
     data object SendBye : Fx
 
@@ -372,7 +380,16 @@ fun reduce(s: MirrorState, ev: Ev): Step = when (ev) {
         if (s.path is Path.Live) {
             Step(
                 s.copy(sess = Sess.Live(ev.peer), retries = 0),
-                listOf(Fx.CancelHandshakeWatchdog, Fx.AttachApps, Fx.StartKeepalive),
+                // ★ 디코더를 다시 세우는 자리는 **여기 하나뿐이다.**
+                //
+                // 예전엔 전화를 걸기 시작할 때(`StartConnect`) 죽였는데, 그러면 그 연결이
+                // 실패했을 때 멀쩡하던 디코더까지 같이 잃는다. 실기기에서 USB 전환이
+                // 8초 뒤 핸드셰이크 실패로 끝났고, 그 8초 동안 화면은 이미 죽어 있었다.
+                //
+                // 새 세션 = 새 키·새 프레임 번호·새 타임스탬프 기준점이라 여기서는 실제로
+                // 다시 세워야 한다. 반대로 경로만 갈리는 무손실 전환(`PathSwapped`)은
+                // 세션이 그대로이므로 이 효과가 나가지 않는다 — 그게 이 자리의 요점이다.
+                listOf(Fx.CancelHandshakeWatchdog, Fx.ResetDecoder, Fx.AttachApps, Fx.StartKeepalive),
             )
         } else {
             // ★ 경로가 이미 죽은 뒤에 도착한 ServerHello. read 루프가 프레임을 넘긴 직후

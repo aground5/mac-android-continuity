@@ -34,6 +34,8 @@ class LanClient(private val scope: CoroutineScope) : Bearer {
     override var onConnected: (() -> Unit)? = null
     override var onDisconnected: ((Throwable?) -> Unit)? = null
     var onVideoPacket: ((MiniRtpPacket) -> Unit)? = null  // UDP 영상 (Mini-RTP)
+    /** UDP PING에 대한 Mac의 답 — 세션 레이어가 경로 생사를 판정하는 유일한 근거. */
+    var onUdpPong: ((nonce: ByteArray, body: ByteArray) -> Unit)? = null
 
     @Volatile private var socket: Socket? = null
     @Volatile private var output: OutputStream? = null
@@ -145,6 +147,15 @@ class LanClient(private val scope: CoroutineScope) : Bearer {
                 // ICE 프로브를 먼저 본다 — 프로브 타입(2·3)은 UdpType(0·1)에 없어
                 // 영상 파서가 어차피 null을 준다.
                 if (onUdpProbe?.invoke(pkt.data, pkt.length, from) == true) continue
+
+                // PONG은 영상 파서가 아니라 여기서 먼저 갈라낸다 — 파서가 타입 불일치로
+                // null을 주면 "UDP parse null" 경고가 매 PONG마다 찍혀 로그가 오염된다.
+                if (UdpType.from(pkt.data.getOrNull(0)?.toInt()?.and(0xFF) ?: -1) == UdpType.PONG) {
+                    WireFormat.parseUdpPong(pkt.data, pkt.length)?.let { (nonce, body) ->
+                        onUdpPong?.invoke(nonce, body)
+                    }
+                    continue
+                }
 
                 count++
                 if (count <= 3 || count % 120 == 0) {

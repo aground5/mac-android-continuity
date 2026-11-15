@@ -79,7 +79,7 @@ class SessionChannel(
         val packets = WireFormat.packetizeVideo(
             frameId = meta.frameId, keyframe = meta.keyframe,
             payloadType = if (meta.hevc) 1 else 0, timestampMs = meta.timestampMs,
-            body = body, nextPacketSeq = { nextPacketSeq() },
+            body = body, isLtr = meta.isLtr, nextPacketSeq = { nextPacketSeq() },
         )
         for (p in packets) b.sendVideo(p)
         return packets.size

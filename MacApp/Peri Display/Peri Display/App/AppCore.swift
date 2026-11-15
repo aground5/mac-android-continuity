@@ -55,6 +55,10 @@ final class AppCore: ObservableObject {
         // AoaLink의 무응답 워치독이 8초 뒤 한 번 더 "정리"한다(실기기 로그).
         // LAN 세션이면 no-op이다.
         sessions.onSessionReleased = { [weak aoa] s in aoa?.forget(s) }
+        // 제어 채널이 살아난 순간 곧바로 BLE 라운드를 끝낸다. 없으면 펀칭이 방금 이겼어도
+        // `.punching`의 13초 마감이 다 찰 때까지 GATT를 붙들고 있는다 — 이미 쓸모가 없어진
+        // 창이라 배터리·라디오만 쓴다.
+        sessions.onSessionEstablished = { [weak self] in self?.pairing.finishRound() }
 
         // 페어링 인증 완료 → 연결 후보(host + STUN srflx)를 모아 BLE로 전달 → Android가 접속·펀칭.
         // 수집은 SessionManager가 한다: STUN은 실제 미디어 소켓에서 나가야 매핑이 유효하고,

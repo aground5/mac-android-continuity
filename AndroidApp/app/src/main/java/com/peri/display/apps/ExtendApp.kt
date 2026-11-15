@@ -132,8 +132,8 @@ class ExtendApp(
             // → 마지막에 온 값이 언제나 진실이다. 이미 선 디코더에도 반영해 둔다.
             hdr10 = sp.dynamicRange == DynamicRange.DYNAMIC_RANGE_HDR10
             hdrStaticInfo = if (sp.hdrStaticInfo.isEmpty) null else sp.hdrStaticInfo.toByteArray()
-            // 레인지가 바뀌면 디코더를 새로 만들어야 한다(색상 설정이 굳어 있다). 확장 경로의
-            // 주기 IDR은 2초 간격이라 그냥 두면 그만큼 화면이 멈추므로 직접 청한다.
+            // 레인지가 바뀌면 디코더를 새로 만들어야 한다(색상 설정이 굳어 있다). Mac의 주기
+            // IDR은 30초 간격이라 그냥 두면 그만큼 화면이 멈추므로 직접 청한다.
             // 제어 채널과 영상 채널은 순서 보장이 없어서, 새 키프레임이 SessionParams보다
             // 먼저 왔을 수 있다는 점도 이걸로 덮인다.
             if (decoder?.applyDynamicRange(hdr10, hdrStaticInfo) == true) {

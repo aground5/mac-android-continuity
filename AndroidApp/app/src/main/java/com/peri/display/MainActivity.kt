@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -71,8 +73,6 @@ import com.peri.display.vm.MirrorController
 import kotlinx.coroutines.delay
 
 private const val ACTION_USB_PERMISSION = "com.peri.display.USB_PERMISSION"
-/** 권한 거부/무시 시 재요청 간격 — 대화상자 도배 방지. */
-private const val PERMISSION_RETRY_MS = 30_000L
 
 /** 액세서리가 보이는 동안의 확인 주기. 케이블이 꽂혀 있으니 충전 중이고, 반응이 빨라야 한다. */
 private const val ACCESSORY_POLL_MS = 3_000L
@@ -187,27 +187,32 @@ private fun MirrorApp(initialSpec: DisplaySpec) {
 
     LaunchedEffect(Unit) {
         val usb = context.getSystemService(Context.USB_SERVICE) as? UsbManager
-        var lastPermissionReqAt = 0L
+        // 이 액세서리에 대해 이미 권한을 요청했는가 — **한 번만** 묻기 위한 표시.
+        //
+        // 예전엔 30초마다 다시 물었다(대화상자 도배 방지가 목적이었지만, 그래도 계속
+        // 재요청이 나갔다). 사람이 대화상자를 닫거나 무시했는데 30초마다 또 뜨면 그게
+        // 오히려 성가시다 — 한 번 물어봤으면 답(승인/거부)이 올 때까지 혹은 케이블을
+        // 다시 꽂을 때까지 더 묻지 않는다. `UsbAccessory`는 제조사·모델·버전·시리얼로
+        // equals가 잡히므로 같은 액세서리인지 객체 비교로 충분하다.
+        var requestedFor: UsbAccessory? = null
         while (true) {
-            usb?.accessoryList?.firstOrNull()?.let { accessory ->
-                if (usb.hasPermission(accessory)) {
-                    controller.onAccessoryTick(accessory, latestSpec)
-                } else {
+            val accessory = usb?.accessoryList?.firstOrNull()
+            when {
+                accessory == null -> requestedFor = null   // 케이블 빠짐 — 다음 삽입에 다시 물을 수 있게
+                usb.hasPermission(accessory) -> controller.onAccessoryTick(accessory, latestSpec)
+                requestedFor != accessory -> {
                     // 권한이 없으면 예전엔 ATTACHED intent만 기다리다 영원히 멈췄다(앱이 이미 실행 중이면
                     // 그 intent가 안 올 수 있음) → ClientHello를 못 보내 Mac은 '세션 대기'로 무한 대기.
-                    // 이제 직접 요청해서 부트스트랩을 우리가 진행시킨다(도배 방지 위해 주기 제한).
-                    val now = System.currentTimeMillis()
-                    if (now - lastPermissionReqAt > PERMISSION_RETRY_MS) {
-                        lastPermissionReqAt = now
-                        Log.i("AOA", "accessory 권한 요청")
-                        val pi = PendingIntent.getBroadcast(
-                            context, 0,
-                            Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
-                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-                        )
-                        runCatching { usb.requestPermission(accessory, pi) }
-                            .onFailure { Log.e("AOA", "권한 요청 실패: ${it.message}") }
-                    }
+                    // 이제 직접 요청해서 부트스트랩을 우리가 진행시킨다 — 단, 이 액세서리당 한 번뿐이다.
+                    requestedFor = accessory
+                    Log.i("AOA", "accessory 권한 요청")
+                    val pi = PendingIntent.getBroadcast(
+                        context, 0,
+                        Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+                    )
+                    runCatching { usb.requestPermission(accessory, pi) }
+                        .onFailure { Log.e("AOA", "권한 요청 실패: ${it.message}") }
                 }
             }
             // 케이블이 없으면 느리게 본다.
@@ -265,6 +270,16 @@ private fun MirrorApp(initialSpec: DisplaySpec) {
     val connected = controller.state == ConnState.STREAMING
     /** 확장 앱이 떠서 실제로 Mac 화면이 오고 있는가 — 전체화면으로 갈 조건. */
     val streaming = connected && controller.extendRunning
+
+    /**
+     * 선을 다시 놓는 중 — **설정 화면으로 돌아가지 않는다.**
+     *
+     * 재협상은 흔하다(망 전환, USB 연결/분리, 홀펀칭 재시도). 그때마다 `STREAMING`이 잠깐
+     * 벗겨지는데, 그걸 "연결 안 됨"으로 읽어 페어링 화면을 덮으면 사용자는 방금 쓰던 화면을
+     * 잃는다. 상대도 세션도 그대로이고 바뀌는 건 어느 선으로 가느냐뿐이므로, 마지막 프레임을
+     * 그대로 둔 채 "다시 붙는 중"만 얹는다.
+     */
+    val reconnecting = controller.reconnecting
 
     // BLE 페어링/시그널링 — **앱 수명 내내** 산다.
     //
@@ -388,7 +403,10 @@ private fun MirrorApp(initialSpec: DisplaySpec) {
             },
         )
 
-        if (!connected) {
+        if (reconnecting) {
+            // 마지막 프레임 위에 얹기만 한다 — Surface도 디코더도 그대로 살아 있다.
+            ReconnectingOverlay(controller.statusMessage)
+        } else if (!connected) {
             SetupOverlay(controller, currentSpec, bleStatus, pin,
                          showDiagnostics = showDiagnostics,
                          onToggleDiagnostics = { showDiagnostics = !showDiagnostics },
@@ -478,6 +496,45 @@ private fun DiagnosticsScrim(
             .clickable { onDismiss() },
     ) {
         DiagnosticsSheet(conn = conn, pair = pair, link = link)
+    }
+}
+
+/**
+ * 선을 다시 놓는 중 — **마지막 프레임 위에 얹기만 한다.**
+ *
+ * 여기서 설정 화면으로 돌아가면 안 되는 이유가 셋이다:
+ *
+ *  1. 상대도 세션도 그대로다. 바뀌는 건 어느 선으로 가느냐뿐이라 "연결 안 됨"이 거짓말이다.
+ *  2. 재협상은 흔하다 — 망 전환, USB 연결/분리, 홀펀칭 재시도. 실기기 로그에서 90초에
+ *     여섯 번 일어났고, 그때마다 화면이 통째로 갈렸다가 1~2초 뒤 돌아왔다.
+ *  3. 무엇보다 **마지막 프레임을 지우지 않는다.** 화면이 얼어 있는 채로 "다시 붙는 중"이
+ *     보이는 편이, 검은 설정 화면으로 튕겼다가 돌아오는 것보다 실제 상태에 가깝다.
+ *
+ * 배경을 완전히 덮지 않는 것도 같은 이유다 — 뒤에 있던 그림이 비쳐야 "잠깐 멈춘 것"으로 읽힌다.
+ */
+@Composable
+private fun BoxScope.ReconnectingOverlay(status: String) {
+    Column(
+        modifier = Modifier
+            .align(Alignment.Center)
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 28.dp, vertical = 22.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp)
+        Text(
+            "다시 붙는 중…",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+        )
+        // 기계가 내는 사유를 그대로 보여 준다("재협상: 기본망 전환" 등). 사용자가 무엇을
+        // 기다리는지 알면 몇 초를 기다릴 수 있고, 모르면 앱을 죽인다.
+        Text(
+            status,
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.7f),
+        )
     }
 }
 

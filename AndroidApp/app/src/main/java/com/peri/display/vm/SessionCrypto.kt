@@ -147,6 +147,31 @@ class SessionCrypto {
         return WireFormat.udpHelloDatagram(id, nonce, body)
     }
 
+    /**
+     * 경로 생사 확인용 PING — 와이어 모양은 [helloDatagram]과 같다(HELLO 참조 참고).
+     * 다른 함수로 가른 이유는 봉인 자체는 같아도 **의미가 다르기 때문**이다: HELLO는
+     * "이 세대를 (재)등록해라"이고 PING은 "살아 있으면 답해라"다. 호출부가 어느 쪽을
+     * 보냈는지 헷갈리면 로그도, 재시도 카운터도 뒤섞인다.
+     */
+    fun pingDatagram(): ByteArray? {
+        val keys = epoch ?: return null
+        val id = channelId ?: return null
+        val (nonce, body) = synchronized(sendLock) { keys.seal(id) }
+        return WireFormat.udpPingDatagram(id, nonce, body)
+    }
+
+    /**
+     * PONG 하나. **지금 세대의 것인지까지 확인한다** — 세대가 갈린 뒤 늦게 도착한 PONG이
+     * "경로가 살아 있다"는 잘못된 결론으로 이어지면 안 되므로, 복호화된 평문(세대 id)이
+     * 지금 [channelId]와 같을 때만 true다.
+     */
+    fun openPong(nonce: ByteArray, body: ByteArray): Boolean {
+        val keys = epoch ?: return false
+        val id = channelId ?: return false
+        val plain = runCatching { keys.open(nonce, body) }.getOrNull() ?: return false
+        return plain.contentEquals(id)
+    }
+
     // MARK: - 최신성 레인 (영상)
     //
     // [reliablePipe]가 곧 "케이블인가"다. 그 한 값으로 키가 갈린다 — 이 판단이 여기

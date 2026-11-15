@@ -7,10 +7,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.peri.display.proto.AppId
 import com.peri.display.proto.ControlMessage
+import com.peri.display.proto.KeyframeRequest
 import com.peri.display.proto.ShareParams
 import com.peri.display.proto.ShareRequest
 import com.peri.display.proto.ShareStatus
 import com.peri.display.proto.VideoCodec
+import com.peri.display.share.LTR_SLOTS
 import com.peri.display.share.ScreenShare
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +71,26 @@ class ShareApp(
     private var frameId = 0L
 
     /**
+     * 슬롯마다 지금 그 자리에 새겨진 프레임 번호(-1 = 빈 슬롯).
+     *
+     * **왜 여기 있나:** 인코더는 슬롯만 알고 프레임 번호는 모른다(번호를 매기는 건 이 앱의
+     * 일이다). Mac은 반대로 프레임 번호만 알고 슬롯은 모른다 — 선에 실리는 건 "이 프레임이
+     * 앵커다"라는 비트 하나뿐이다. 둘을 잇는 자리가 정확히 여기다.
+     */
+    private val slotFrame = LongArray(LTR_SLOTS) { -1L }
+
+    /**
+     * Mac이 확인해 준 프레임 번호가 **아직 살아 있는 앵커인가** — 아니면 -1.
+     *
+     * 그 사이에 같은 슬롯을 다른 프레임이 덮었으면 늦은 ACK이다. 그걸 그대로 확정하면
+     * 인코더가 이미 사라진 참조를 가리키게 된다.
+     */
+    private fun slotOf(ackedFrame: Int): Int {
+        if (ackedFrame <= 0) return -1
+        return slotFrame.indexOfFirst { it == ackedFrame.toLong() }
+    }
+
+    /**
      * 첫 프레임의 PTS. 이 값을 빼서 스트림이 0에서 시작하게 한다.
      *
      * 인코더가 주는 PTS는 부팅 이후 시각이라 값이 크고, 32비트 필드에 담으면 기기가
@@ -105,17 +127,53 @@ class ShareApp(
 
     override val isStreaming: Boolean get() = runner.state.isRunning
 
-    override fun receive(msg: ControlMessage): Boolean {
-        if (!msg.hasShareRequest()) return false
-        when (msg.shareRequest.action) {
-            ShareRequest.Action.ACTION_START -> {
-                Log.i(TAG, "Mac이 화면 공유를 요청")
-                runner.send(ShareEv.Requested)
+    /**
+     * ★ `KeyframeRequest`·`LtrAck`은 **확장이 쓰던 어휘를 그대로 되쓴다.**
+     *
+     * 와이어 v1에는 `serviceId`가 없어 등록부가 앱들에게 순서대로 물어보는데, 확장의
+     * Android 절반은 이 둘을 **보내기만 하고 받지 않는다**(Mac이 굽고 우리가 푸니까).
+     * 그래서 이 기기에 도착한 갱신 요청과 LTR ACK은 임자가 하나뿐이다 — 공유다.
+     *
+     * 방향이 뒤집혔을 뿐 뜻이 같으므로 새 메시지를 만들 이유가 없다. proto를 안 늘린 만큼
+     * 옛 Mac과도 그대로 붙는다.
+     */
+    override fun receive(msg: ControlMessage): Boolean = when {
+        msg.hasShareRequest() -> {
+            when (msg.shareRequest.action) {
+                ShareRequest.Action.ACTION_START -> {
+                    Log.i(TAG, "Mac이 화면 공유를 요청")
+                    runner.send(ShareEv.Requested)
+                }
+                ShareRequest.Action.ACTION_STOP -> runner.send(ShareEv.StopRequested("Mac에서 중지"))
+                else -> {}
             }
-            ShareRequest.Action.ACTION_STOP -> runner.send(ShareEv.StopRequested("Mac에서 중지"))
-            else -> {}
+            true
         }
-        return true
+
+        msg.hasKeyframeRequest() -> {
+            val req = msg.keyframeRequest
+            val needIdr = req.need == KeyframeRequest.Need.NEED_IDR
+            Log.i(TAG, "Mac이 갱신을 청함 — ${req.need.name} (사유=${req.cause.name}, " +
+                "마지막 온전한 프레임=${req.lastGoodFrame})")
+            ScreenShare.requestRefresh(needIdr, req.cause.name)
+            true
+        }
+
+        msg.hasLtrAck() -> {
+            // 프레임 번호는 여기서 매겼으므로 슬롯을 되찾는 것도 여기 일이다.
+            val acked = msg.ltrAck.frameId
+            val slot = synchronized(counters) { slotOf(acked) }
+            if (slot < 0) {
+                // 앵커를 덮어쓴 뒤에 도착한 늦은 ACK — 버리는 게 맞다. 그 슬롯은 이미
+                // 다른 프레임이 차지했고, 옛 프레임을 가리키면 화면이 깨진다.
+                Log.i(TAG, "지난 LTR ACK 무시 — frame=$acked")
+            } else {
+                ScreenShare.confirmLtr(slot)
+            }
+            true
+        }
+
+        else -> false
     }
 
     // MARK: - 부작용
@@ -127,7 +185,11 @@ class ShareApp(
             is ShareFx.ReportPhase -> sendStatus(fx.phase, fx.reason)
             is ShareFx.Report -> ch.reportApp(id, fx.running, fx.detail)
             ShareFx.ResetPts -> synchronized(counters) { ptsBaseMs = -1L }
-            ShareFx.ResetFrameIds -> synchronized(counters) { frameId = 0L; ptsBaseMs = -1L }
+            // 번호가 처음으로 돌아가면 슬롯 장부도 같이 비워야 한다 — 안 그러면 옛 번호에
+            // 대한 ACK이 새 스트림의 같은 번호와 우연히 맞아 사라진 참조를 확정해 버린다.
+            ShareFx.ResetFrameIds -> synchronized(counters) {
+                frameId = 0L; ptsBaseMs = -1L; slotFrame.fill(-1L)
+            }
             is ShareFx.Log -> Log.i(TAG, fx.msg)
         }
     }
@@ -149,7 +211,7 @@ class ShareApp(
 
     /** [ScreenShare]가 바깥으로 내는 사실들을 이 앱에 잇는다. */
     private fun wireScreenShare() {
-        ScreenShare.onFrame = { au, key, pts -> sendFrame(au, key, pts) }
+        ScreenShare.onFrame = { au, key, pts, slot -> sendFrame(au, key, pts, slot) }
         ScreenShare.onGranted = { runner.send(ShareEv.Granted) }
         ScreenShare.onDenied = { why -> runner.send(ShareEv.Denied(why)) }
         ScreenShare.onStopped = { why -> runner.send(ShareEv.Stopped(why)) }
@@ -175,10 +237,14 @@ class ShareApp(
      * 봉인도 경로 선택도 조각화도 [AppChannel.sendMedia] 안쪽 일이다 — 이 앱은 번호를
      * 매기고 한도를 지킬 뿐이다.
      */
-    private fun sendFrame(bitstream: ByteArray, keyframe: Boolean, ptsMs: Long) {
+    private fun sendFrame(bitstream: ByteArray, keyframe: Boolean, ptsMs: Long, ltrSlot: Int) {
         val (id, pts) = synchronized(counters) {
             if (ptsBaseMs < 0) ptsBaseMs = ptsMs
-            frameId++ to (ptsMs - ptsBaseMs)
+            val next = frameId + 1
+            frameId = next
+            // 앵커라면 슬롯 장부를 지금 갱신한다 — ACK이 돌아올 때 되짚을 유일한 근거다.
+            if (ltrSlot in slotFrame.indices) slotFrame[ltrSlot] = next
+            next to (ptsMs - ptsBaseMs)
         }
         if (id > SHARE_FRAME_LIMIT) {
             ScreenShare.stop("공유가 너무 오래 이어졌습니다 — 다시 시작해 주세요")
@@ -187,7 +253,7 @@ class ShareApp(
         ch.sendMedia(
             bitstream,
             MediaMeta(frameId = id, timestampMs = pts, keyframe = keyframe,
-                      hevc = ScreenShare.isHevcNow),
+                      hevc = ScreenShare.isHevcNow, isLtr = ltrSlot >= 0),
         )
     }
 }

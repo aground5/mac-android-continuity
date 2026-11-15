@@ -43,9 +43,9 @@ enum class WireType(val raw: Int) {
     }
 }
 
-/** UDP 데이터그램 타입 (길이 프리픽스 없음). */
+/** UDP 데이터그램 타입 (길이 프리픽스 없음). 2·3은 IceUdpType(PROBE/PROBE_ACK)이 쓴다 — 겹치면 안 된다. */
 enum class UdpType(val raw: Int) {
-    HELLO(0), VIDEO(1);
+    HELLO(0), VIDEO(1), PING(4), PONG(5);
 
     companion object {
         private val BY_RAW: Array<UdpType?> =
@@ -171,6 +171,35 @@ object WireFormat {
         return out
     }
 
+    /**
+     * UDP PING 데이터그램 — HELLO와 **와이어 모양이 같다**(둘 다 세대 id·nonce·봉인).
+     * 타입 바이트만 다르다. Mac은 이걸 HELLO와 똑같이 검증해 피어를 (재)등록하고, 그 위에
+     * PONG으로 답한다. 그래서 굶주림 감시가 "쐈다"가 아니라 "닿았다"를 직접 확인할 수 있다
+     * ([SessionCrypto.pingDatagram] 참조).
+     */
+    fun udpPingDatagram(channelId: ByteArray, nonce: ByteArray, body: ByteArray): ByteArray {
+        val out = ByteArray(1 + channelId.size + nonce.size + body.size)
+        out[0] = UdpType.PING.raw.toByte()
+        channelId.copyInto(out, 1)
+        nonce.copyInto(out, 1 + channelId.size)
+        body.copyInto(out, 1 + channelId.size + nonce.size)
+        return out
+    }
+
+    /**
+     * 수신 PONG 데이터그램(타입 바이트 포함 원본) → nonce · 봉인. 형식은 HELLO와 같다
+     * `[1B 5][12B nonce][sealed(세대 id)]` — 세대 id는 앞에 평문으로 오지 않는다. PONG은
+     * 이미 우리가 PING을 보낸 그 세대에 대한 답이라 어느 세대인지 물을 필요가 없고, Mac이
+     * 그 id를 봉인 안에 실어 보내면 우리가 열어서 **지금 세대와 같은지** 대조한다
+     * (엉뚱한 세대의 늦은 PONG을 걸러낸다).
+     */
+    fun parseUdpPong(d: ByteArray, length: Int): Pair<ByteArray, ByteArray>? {
+        val head = 1 + NONCE_LEN
+        if (length <= head + 16) return null   // 최소 태그 16B는 있어야 한다
+        if (UdpType.from(d[0].toInt() and 0xFF) != UdpType.PONG) return null
+        return d.copyOfRange(1, head) to d.copyOfRange(head, length)
+    }
+
     // ── 화면 공유 송신 (Android → Mac) ──────────────────────────────────────
     //
     // Mac이 확장을 보낼 때 쓰는 것과 **똑같은 포맷**이다. 방향만 뒤집혔지 프레임 모양을
@@ -206,6 +235,8 @@ object WireFormat {
         payloadType: Int,
         timestampMs: Long,
         body: ByteArray,
+        /** 이 프레임이 장기 참조 앵커인가 — 받는 쪽이 ACK할 근거. */
+        isLtr: Boolean,
         nextPacketSeq: () -> Int,
     ): List<ByteArray> {
         val total = maxOf(1, (body.size + MAX_UDP_CHUNK - 1) / MAX_UDP_CHUNK)
@@ -218,7 +249,7 @@ object WireFormat {
             val b0 = (VERSION shl 6) or ((if (keyframe) 1 else 0) shl 5) or
                      ((if (i == total - 1) 1 else 0) shl 4) or (payloadType and 0x0F)
             d[1] = b0.toByte()
-            d[2] = 0                                  // isLtr — 공유 경로는 LTR을 쓰지 않는다
+            d[2] = if (isLtr) 1 else 0                // 장기 참조 앵커 표시
             val seq = nextPacketSeq()
             d[3] = ((seq ushr 8) and 0xFF).toByte(); d[4] = (seq and 0xFF).toByte()
             d[5] = ((frameId ushr 24) and 0xFF).toByte(); d[6] = ((frameId ushr 16) and 0xFF).toByte()
