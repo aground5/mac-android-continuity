@@ -50,6 +50,31 @@ nonisolated final class EncoderBox: @unchecked Sendable {
     }
 }
 
+/**
+ 지금 말할 수 있는 채널. **인코더 콜백이 이걸 통해서만 채널을 본다.**
+
+ ★ 이 홀더가 없던 때가 "전송을 갈아타면 화면이 안 온다"였다.
+
+ 인코더의 `onEncoded`는 파이프라인을 세울 때의 `ServiceChannel`을 **캡처**하고 있었다.
+ 무손실 재개(RESUME)는 세션이 그대로라 채널 객체도 같아서 아무 문제가 없었는데,
+ LAN↔USB 전환은 **세션이 새로 서므로 채널도 새 객체**다. 그런데 기계는 파이프라인을
+ 일부러 유지하고(`unlinked`가 아무것도 안 버린다 — 그게 무중단의 근거다) `linked`는
+ 이미 서 있으면 손대지 않으므로, 인코더는 **죽은 옛 채널로 계속 쏜다.**
+ `isDatagramPathReady`가 false라 프레임은 조용히 전부 버려지고, 제어 채널은 새 세션
+ 위에서 멀쩡하니 로그에도 아무 이상이 없다.
+
+ 값을 붙들지 않고 **매번 지금 것을 묻게** 하면 그 클래스의 버그가 통째로 사라진다.
+ Android 쪽 `SessionChannel`이 전송을 `() -> Bearer`로 받는 것과 같은 이유다.
+ */
+nonisolated final class ChannelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _c: ServiceChannel?
+    var channel: ServiceChannel? {
+        get { lock.lock(); defer { lock.unlock() }; return _c }
+        set { lock.lock(); _c = newValue; lock.unlock() }
+    }
+}
+
 
 /// 지연 인식형 적응 비트레이트. 수신측이 *고정* 지터버퍼를 두므로, 이 컨트롤러의 목표는
 /// 실제 큐잉지연 q를 그 버퍼 예산(50ms) 안에 유지하는 것 — q≤buffer면 프레임 온타임(hitch/펄싱 없음).

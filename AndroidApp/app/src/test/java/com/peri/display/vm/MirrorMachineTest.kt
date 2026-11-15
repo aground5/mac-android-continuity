@@ -379,10 +379,10 @@ class MirrorMachineTest {
         // 디코더 생성이 기계 밖에 흩어져 있어서, 그 사이에 DropSession이 끼면 아무도 다시
         // 만들지 않았다 — 영상은 도착하는데 그릴 곳이 없는 검은 화면.
         val cold = MirrorState(sess = Sess.Establishing, path = Path.Live(Via.LAN))
-        assertTrue(Fx.EnsureDecoder in cold.fxOf(Ev.SessionLive("Mac")))
+        assertTrue(Fx.AttachApps in cold.fxOf(Ev.SessionLive("Mac")))
 
         val resume = streaming().after(Ev.NegoNeeded("망 전환"), Ev.TransportDown(), Ev.MacAnswered(true))
-        assertTrue(Fx.EnsureDecoder in resume.fxOf(Ev.PathSwapped))
+        assertTrue(Fx.AttachApps in resume.fxOf(Ev.PathSwapped))
     }
 
     @Test

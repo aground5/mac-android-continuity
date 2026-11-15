@@ -1,7 +1,6 @@
 package com.peri.display.decode
 
 import com.peri.display.transport.MiniRtpPacket
-import java.io.ByteArrayOutputStream
 
 /**
  * Mini-RTP 프래그먼트를 frame_id별로 재조립한다. frag_count가 모두 모이면 완성 프레임 반환.
@@ -44,12 +43,26 @@ class VideoReassembler(private val timeoutMs: Long = 500L) {
         }
         if (entry.count == entry.total) {
             pending.remove(p.frameId)
-            val out = ByteArrayOutputStream()
-            for (c in entry.chunks) if (c != null) out.write(c)
             return CompleteFrame(p.frameId, entry.keyframe, entry.isLtr,
-                                 entry.payloadType, entry.timestampMs, out.toByteArray())
+                                 entry.payloadType, entry.timestampMs, join(entry.chunks))
         }
         return null
+    }
+
+    /**
+     * 조각을 하나로 잇는다 — **정확한 크기로 한 번만 잡는다.**
+     *
+     * `ByteArrayOutputStream`을 쓰면 크기를 모른 채 시작해 키프레임 하나에 버퍼를 여러 번
+     * 배로 늘리고, `toByteArray()`가 마지막에 한 번 더 통째로 복사한다. 여기서는 조각이
+     * 다 모인 뒤에야 부르므로 합을 먼저 셀 수 있다.
+     */
+    private fun join(chunks: Array<ByteArray?>): ByteArray {
+        var n = 0
+        for (c in chunks) n += c?.size ?: 0
+        val out = ByteArray(n)
+        var o = 0
+        for (c in chunks) if (c != null) { c.copyInto(out, o); o += c.size }
+        return out
     }
 
     fun clear() = pending.clear()

@@ -32,6 +32,7 @@ nonisolated enum WireType: UInt8 {
 }
 
 /// UDP 데이터그램 타입 (길이 프리픽스 없음 — 데이터그램 경계 = 패킷).
+/// 2·3은 `IceUdpType`(PROBE/PROBE_ACK)이 쓴다 — 겹치면 안 된다.
 nonisolated enum UdpType: UInt8 {
     /// Android → Mac : [1B 0][16B channel_id][12B nonce][sealed(channel_id)]
     ///
@@ -45,6 +46,12 @@ nonisolated enum UdpType: UInt8 {
     /// 그 뒤의 봉인이 진짜 검증이다 — id만 베껴 봐야 열리지 않는다.
     case hello = 0
     case video = 1   // Mac → Android : [1B 1][12B VideoHeader][12B nonce][chunk]
+    /// Android → Mac : 경로 생사 확인. 와이어 모양은 `hello`와 동일(피어 재등록 겸용) —
+    /// 타입 바이트만 다르다. Mac은 이걸 받으면 [pong]으로 답한다.
+    case ping = 4
+    /// Mac → Android : `ping`의 답. `[1B 5][12B nonce][sealed(세대 id)]` — HELLO의 봉인과
+    /// 같은 평문(세대 id)을 실어, Android가 늦게 온 지난 세대의 PONG을 걸러낼 수 있게 한다.
+    case pong = 5
 }
 
 /// 영상 UDP 단편화 파라미터.
@@ -192,6 +199,9 @@ nonisolated enum WireFormat {
     ///
     /// 길이만 본다 — 내용 검증은 봉인이 한다. 여기서 하는 일은 "이 바이트들이 어느 자리에
     /// 있는가"를 정하는 것뿐이고, 그 셋 중 하나라도 모자라면 우리 프레임이 아니다.
+    ///
+    /// **PING도 이 함수로 판다.** 와이어 모양이 HELLO와 동일하다(피어 재등록 겸용) —
+    /// 타입 바이트로 이미 갈렸으니 본문 파서를 둘로 나눌 이유가 없다.
     static func parseUdpHello(_ rest: Data) -> (channel: Data, nonce: Data, body: Data)? {
         let head = datagramChannelIDBytes + 12
         guard rest.count > head + 16 else { return nil }   // 최소 태그 16B는 있어야 한다
@@ -199,6 +209,16 @@ nonisolated enum WireFormat {
         return (channel: rest.subdata(in: s..<(s + datagramChannelIDBytes)),
                 nonce: rest.subdata(in: (s + datagramChannelIDBytes)..<(s + head)),
                 body: rest.subdata(in: (s + head)..<rest.endIndex))
+    }
+
+    /// PONG 데이터그램: `[1B 5][12B nonce][sealed(세대 id)]`. Android의 PING에 대한 답 —
+    /// 세대 id를 봉인해 실으면 Android가 지금 세대의 것인지 직접 대조할 수 있다.
+    static func pongDatagram(nonce: Data, body: Data) -> Data {
+        var out = Data(capacity: 1 + nonce.count + body.count)
+        out.append(UdpType.pong.rawValue)
+        out.append(nonce)
+        out.append(body)
+        return out
     }
 
     // MARK: - 수신 정규화 (화면 공유: Android → Mac)

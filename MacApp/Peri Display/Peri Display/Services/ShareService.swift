@@ -77,6 +77,89 @@ private nonisolated final class ShareGate: @unchecked Sendable {
     var frameCount: Int { lock.lock(); defer { lock.unlock() }; return _frames }
 }
 
+/**
+ 손실 감지와 갱신 요청 조율 — **전송 큐에서** 돈다.
+
+ 확장 경로에서는 이 일을 Android가 한다(`ExtendApp.requestRefresh`). 여기서는 방향이
+ 뒤집혀 우리가 받는 쪽이므로 판단도 이쪽에 있다. 규칙은 같다:
+
+  · **참조가 하나도 없다** → `.idr`. 방금 붙어서 아직 키프레임을 못 봤다면 그 뒤로 오는
+    P 프레임은 아무리 받아도 못 푼다 — 확장에서 실기기의 검은 화면이 정확히 이것이었다.
+  · **프레임 번호에 구멍** → `.refresh`. 참조는 살아 있으니 작은 복구 프레임으로 족하다.
+
+ 왜 패킷이 아니라 **프레임 번호**로 손실을 세는가: 조각이 하나라도 빠지면 채널이 그
+ 프레임을 아예 안 올려 준다(봉인이 프레임 전체를 덮는다). 그래서 우리에게 도달하는
+ frame_id의 구멍이 곧 "참조 사슬이 끊겼다"이고, 그게 복구가 필요한지의 정확한 기준이다.
+ 패킷 손실은 그보다 넓다 — 재조립이 성공한 손실은 복구가 필요 없다.
+ */
+private nonisolated final class ShareRecovery: @unchecked Sendable {
+
+    /// 청할 내용 한 벌.
+    struct Ask {
+        let need: PeriKeyframeRequest.Need
+        let cause: PeriKeyframeRequest.Cause
+        let lastGood: UInt32
+    }
+
+    /**
+     갱신 요청 사이의 최소 간격(ms).
+
+     손실은 몰려서 온다 — 한 번 끊기면 여러 프레임이 같이 사라지고, 프레임마다 청하면
+     그 각각이 복구 프레임을 부른다. 다만 **창 안의 요청을 버리지는 않는다**: 버리면
+     하필 그 손실이 복구되지 않는다. 미뤄 뒀다가 창이 열리는 첫 프레임에 함께 내보낸다
+     (인코더가 정지 화면도 1초마다 되풀이하므로 프레임은 반드시 다시 온다).
+     */
+    private static let minIntervalNs: UInt64 = 300_000_000
+
+    private let lock = NSLock()
+    private var lastFrame: UInt32 = 0
+    private var seenAny = false
+    /// 키프레임을 한 번이라도 봤는가 — 못 봤으면 `.refresh`는 아무 소용이 없다.
+    private var haveReference = false
+    private var lastAskAt: UInt64 = 0
+    private var pendingNeed: PeriKeyframeRequest.Need?
+    private var pendingCause: PeriKeyframeRequest.Cause = .unspecified
+
+    /// 리시버를 세우거나 내린다 — 참조도 번호도 처음으로 돌아간다.
+    func reset() {
+        lock.lock()
+        lastFrame = 0; seenAny = false; haveReference = false
+        lastAskAt = 0; pendingNeed = nil; pendingCause = .unspecified
+        lock.unlock()
+    }
+
+    /// 프레임 하나가 도착했다. 지금 청해야 하면 그 내용을, 아니면 nil.
+    func note(frameId: UInt32, keyframe: Bool) -> Ask? {
+        lock.lock(); defer { lock.unlock() }
+        if keyframe { haveReference = true }
+
+        if !haveReference {
+            escalate(.idr, .decoderStarted)
+        } else if seenAny, frameId > lastFrame &+ 1 {
+            // ⚠ UDP는 순서를 뒤집을 수 있어서 재정렬 한 번에 헛짚을 수 있다. 그 대가는
+            // 복구 프레임 하나이고, 아래 최소 간격이 그마저 묶는다. 반대로 재정렬을
+            // 기다리려면 지연을 감수해야 하는데, 그건 이 경로가 사는 이유와 반대다.
+            escalate(.refresh, .packetLoss)
+        }
+        if !seenAny || frameId > lastFrame { lastFrame = frameId; seenAny = true }
+
+        guard let need = pendingNeed else { return nil }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard lastAskAt == 0 || now &- lastAskAt >= Self.minIntervalNs else { return nil }
+        lastAskAt = now
+        pendingNeed = nil
+        return Ask(need: need, cause: pendingCause, lastGood: lastFrame)
+    }
+
+    /// `.idr`은 `.refresh`를 덮는다 — 참조가 없는데 작은 복구 프레임을 받아 봐야 못 푼다.
+    private func escalate(_ need: PeriKeyframeRequest.Need, _ cause: PeriKeyframeRequest.Cause) {
+        if pendingNeed == nil || need == .idr {
+            pendingNeed = need
+            pendingCause = cause
+        }
+    }
+}
+
 @MainActor
 final class ShareService: ObservableObject, PeriApp {
 
@@ -125,6 +208,13 @@ final class ShareService: ObservableObject, PeriApp {
     /// 화면이 남는다. 상대의 인코더가 멈추기까지는 늘 몇 프레임이 더 온다.
     private let gate = ShareGate()
 
+    /// 손실 감지와 갱신 요청 — **전송 큐에서** 돈다.
+    private let recovery = ShareRecovery()
+
+    /// 갱신 요청·LTR ACK이 나갈 채널. **값을 붙들지 않고 매번 지금 것을 묻는다** —
+    /// 이 앱은 세션보다 오래 살고 채널은 세션과 함께 갈린다(`ChannelBox` 주석 참조).
+    private let channelBox = ChannelBox()
+
     private var consentDeadlineTask: Task<Void, Never>?
 
     init(fingerprint: Fingerprint) {
@@ -135,6 +225,7 @@ final class ShareService: ObservableObject, PeriApp {
 
     func attach(_ ch: ServiceChannel) async {
         channel = ch
+        channelBox.channel = ch
         await dispatch(.linked)
         // 전송이 갈렸을 수 있다(무선 → 케이블). 입력 통로를 다시 묻는다.
         refreshInputs()
@@ -142,6 +233,7 @@ final class ShareService: ObservableObject, PeriApp {
 
     func detach(_ reason: DetachReason) async {
         channel = nil
+        channelBox.channel = nil
         await dispatch(.unlinked)
         if case .deviceGone(let why) = reason { await quit(why) }
     }
@@ -198,6 +290,28 @@ final class ShareService: ObservableObject, PeriApp {
     private nonisolated func receiveMedia(_ au: Data, _ meta: MediaMeta) {
         guard gate.open else { return }
         renderer.enqueue(au, keyframe: meta.keyframe, timestampMs: meta.timestampMs)
+
+        // ① 앵커를 온전히 받았다고 알린다. 저쪽은 **확인된 앵커만** 참조하므로, 이 한 줄이
+        //    없으면 상대의 LTR은 영영 쓰이지 못하고 복구가 전부 IDR로 떨어진다.
+        if meta.isLtr {
+            var ack = PeriLtrAck()
+            ack.frameID = meta.frameId
+            var m = PeriControlMessage(); m.ltrAck = ack
+            _ = channelBox.channel?.sendReliable(m)
+        }
+
+        // ② 사슬이 끊겼는가. 끊겼으면 무엇이 필요한지까지 여기서 정한다 — 그 답을 아는
+        //    쪽은 디코더를 가진 쪽뿐이고, 상대는 추측할 방법이 없다.
+        if let ask = recovery.note(frameId: meta.frameId, keyframe: meta.keyframe) {
+            var req = PeriKeyframeRequest()
+            req.lastGoodFrame = ask.lastGood
+            req.need = ask.need
+            req.cause = ask.cause
+            var m = PeriControlMessage(); m.keyframeRequest = req
+            if channelBox.channel?.sendReliable(m) == true {
+                log.info("갱신 요청 → \(String(describing: ask.need)) (사유=\(String(describing: ask.cause)), 마지막 온전한 프레임=\(ask.lastGood))")
+            }
+        }
         // 프레임이 **선을 타고 오긴 하는가**를 눈으로 확인할 수 있어야 한다. 이게 없으면
         // "안 나온다"의 원인이 수신인지 표시인지 로그만 보고는 못 가른다.
         let n = gate.frameCount
@@ -298,6 +412,7 @@ final class ShareService: ObservableObject, PeriApp {
 
         case .startReceiver:
             channel?.resetMediaReceive()
+            recovery.reset()
             renderer.start()
             gate.open(true)
             openWindow()
@@ -308,6 +423,7 @@ final class ShareService: ObservableObject, PeriApp {
             gate.open(false)
             renderer.stop()
             channel?.resetMediaReceive()
+            recovery.reset()
             closeWindow()
 
         case .tellRemoteStop:

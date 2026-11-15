@@ -134,9 +134,12 @@ class IceAgent {
         }
 
         /** 토큰이 다르면 우리 것이 아니다 → null. */
-        fun parseProbe(d: ByteArray, expecting: ByteArray): Pair<Int, Long>? {
+        fun parseProbe(d: ByteArray, length: Int, expecting: ByteArray): Pair<Int, Long>? {
             val want = 1 + CandidateBundle.TOKEN_LENGTH + 8
-            if (d.size < want) return null
+            // ★ 버퍼 크기가 아니라 **이 패킷의 길이**로 잰다. 수신 버퍼는 재사용되므로
+            // `d.size`로 재면 짧은 쓰레기 데이터그램이 와도 검사를 통과하고, 그 뒤로는
+            // 지난 패킷의 잔해를 토큰이라고 읽게 된다.
+            if (length < want) return null
             val type = d[0].toInt() and 0xFF
             if (type != IceUdpType.PROBE && type != IceUdpType.PROBE_ACK) return null
             for (i in 0 until CandidateBundle.TOKEN_LENGTH) {
@@ -191,9 +194,9 @@ class IceAgent {
      *  - PROBE 수신 → 같은 stamp를 실어 ACK 회신. **회신 자체가 상대에게 경로를 알려준다.**
      *  - PROBE_ACK 수신 → 그 주소가 살아 있는 경로. 되돌아온 stamp로 RTT 계산.
      */
-    fun handleInbound(data: ByteArray, from: Ipv4Endpoint, udp: DatagramSocket): Boolean {
+    fun handleInbound(data: ByteArray, length: Int, from: Ipv4Endpoint, udp: DatagramSocket): Boolean {
         val tk = synchronized(lock) { token } ?: return false
-        val (type, stamp) = parseProbe(data, tk) ?: return false
+        val (type, stamp) = parseProbe(data, length, tk) ?: return false
 
         when (type) {
             IceUdpType.PROBE -> {

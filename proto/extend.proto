@@ -110,9 +110,46 @@ message DisplayConfig {
 // 스트리밍 중 제어
 // -----------------------------------------------------------------------------
 
-// Android → Mac: 손실/복구 시 refresh 요청 (Mac은 LTR-P, ACK된 LTR 없으면 IDR)
+// Android → Mac: 갱신 요청.
+//
+// ★ **두 요청은 다른 요청이다.** 예전엔 하나였고, 그게 실기기의 검은 화면이었다.
+//
+// Mac은 이 메시지를 받으면 LTR-P를 낸다 — ACK된 장기 참조를 가리키는 작은 프레임이라
+// 손실 복구에는 이상적이다(IDR은 스트림에서 가장 큰 버스트라 Wi-Fi 큐를 포화시킨다).
+// 그런데 **방금 선 디코더에는 참조 프레임이 하나도 없다.** LTR-P를 아무리 받아도 풀
+// 수가 없어서 `keyframe=false`로 계속 버려지고, 인코더가 우연히 IDR을 낼 때까지 화면이
+// 검은 채로 남는다. 실기기 로그에서 3963ms · 111프레임이 그렇게 버려졌다.
+//
+// 그래서 "이어 그릴 수 있는가"를 수신측이 말해 준다. 그 답을 아는 쪽은 디코더를 가진
+// 쪽뿐이고, Mac은 추측할 방법이 없다.
 message KeyframeRequest {
   uint32 last_good_frame = 1;          // 마지막으로 온전히 받은 frame_id
+
+  enum Need {
+    // 옛 피어. 손실 복구로 취급한다(기존 동작) — 새 필드를 안 보내던 시절과 같다.
+    NEED_UNSPECIFIED = 0;
+    // 참조는 살아 있다. 앞으로 그릴 수 있게만 해 달라 → 작은 LTR-P로 충분하다.
+    NEED_REFRESH = 1;
+    // **참조가 하나도 없다**(디코더를 방금 세웠다). SPS/PPS가 실린 IDR이라야 한다.
+    NEED_IDR = 2;
+  }
+  Need need = 2;
+
+  // **왜 청하는가.** [Need]가 "무엇을 달라"라면 이건 "무슨 일이 있었나"다.
+  //
+  // 복구에는 쓰이지 않는다 — Mac은 [Need]만 보고 무엇을 낼지 정한다. 이 필드는 순전히
+  // **두 로그를 붙이기 위해** 있다. 갱신은 화면이 검거나 멈췄을 때만 일어나는데, 그때
+  // Mac 로그에는 "IDR 냄"만 남고 Android 로그에는 "청함"만 남아서 둘을 타임스탬프로
+  // 눈대중 맞춰야 했다. 이유가 선을 타고 오면 Mac 로그 한 줄에 원인과 대응이 같이 찍힌다.
+  enum Cause {
+    CAUSE_UNSPECIFIED = 0;
+    CAUSE_DECODER_STARTED = 1;   // 디코더를 세웠다 — 참조가 하나도 없다
+    CAUSE_PACKET_LOSS = 2;       // packet_seq 갭
+    CAUSE_DYNAMIC_RANGE = 3;     // SDR↔HDR 전환으로 코덱을 다시 만든다
+    CAUSE_DECODE_ERROR = 4;      // 손상된 비트스트림에 코덱이 예외를 냈다
+    CAUSE_OUTPUT_STALL = 5;      // 넣는데 안 나온다 — 코덱이 안에서 멎었다
+  }
+  Cause cause = 3;
 }
 
 // Android → Mac: LTR 프레임 수신 확인 (frame_id로 ACK). Mac이 frame_id→LTR토큰 매핑.

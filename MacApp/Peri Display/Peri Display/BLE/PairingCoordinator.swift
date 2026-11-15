@@ -315,6 +315,14 @@ final class PairingCoordinator: ObservableObject {
 
     func cancel() { dispatch(.failed("취소됨")) }
 
+    /// TCP/UDP 세션이 실제로 섰다 — 펀칭 창을 붙들 이유가 사라졌으면 지금 끝낸다.
+    ///
+    /// `AppCore`가 `SessionManager`의 `sessionLive`/`pathSwapped` 처리 시점(제어 채널이
+    /// 살아 있다고 확인되는 바로 그 순간)에 부른다. 라운드가 `.punching` 중이 아니면
+    /// [PairingMachine.reduce]가 조용히 흘려보낸다 — 이 세션이 지금 도는 라운드와 무관할
+    /// 수 있으므로(다른 기기의 재개 등) 여기서 그 구분을 다시 하지 않는다.
+    func finishRound() { dispatch(.roundFinished) }
+
     /// 사용자가 기기 화면의 PIN을 입력했다. **기회는 한 번뿐이다.**
     func submitPin(_ code: String) {
         dispatch(.pinSubmitted(code.trimmingCharacters(in: .whitespaces)))

@@ -82,6 +82,9 @@ nonisolated final class LanServer: @unchecked Sendable {
     /// (봉인이 프레임 전체를 덮는다), 초당 수백 개가 오는 경로에서 세션마다 복호를 시도하는
     /// 건 값이 너무 비싸다. 대신 주소로 가른다 — HELLO를 이미 받아 등록된 피어만 인정한다.
     var onUdpVideo: (@Sendable (UDPPeerID, Data) -> Void)?
+
+    /// 경로 생사 확인 PING(Android → Mac). HELLO와 같은 처리(피어 재등록)를 거친 뒤 불린다.
+    var onUdpPing: (@Sendable (UDPPeerID, Data) -> Void)?
     /// ICE 프로브/ACK 후킹. true를 돌려주면 이 데이터그램은 소비된 것으로 보고 더 처리하지 않는다.
     /// SessionManager가 IceAgent에 연결한다.
     var onUdpProbe: (@Sendable (Data, IPv4Endpoint) -> Bool)?
@@ -323,21 +326,26 @@ nonisolated final class LanServer: @unchecked Sendable {
     // MARK: - UDP
 
     /// 수신 데이터그램 분기. **ICE 프로브를 먼저** 본다 — 펀칭 중에는 HELLO보다 먼저 오고,
-    /// 프로브 타입(2·3)은 UdpType(0·1)에 없어 parseUdp가 어차피 nil을 준다.
+    /// 프로브 타입(2·3)은 UdpType(0·1·4·5)에 없어 parseUdp가 어차피 nil을 준다.
     private func handleUDP(_ data: Data, from: IPv4Endpoint) {
         if onUdpProbe?(data, from) == true { return }
 
         guard let parsed = WireFormat.parseUdp(data) else { return }
         switch parsed.type {
-        case .hello:
-            // 이 주소를 영상 피어로 등록. 같은 주소가 다시 HELLO를 보내면 새 ID를 만들지 않고
-            // 재사용해 재접속 때 좀비 피어가 쌓이지 않게 한다.
+        case .hello, .ping:
+            // 이 주소를 영상 피어로 등록. 같은 주소가 다시 HELLO/PING을 보내면 새 ID를
+            // 만들지 않고 재사용해 재접속 때 좀비 피어가 쌓이지 않게 한다.
+            //
+            // PING이 HELLO와 같은 취급을 받는 이유: 와이어 모양이 같고(피어 재등록 겸용),
+            // 망 전환으로 주소가 바뀐 뒤 첫 HELLO가 유실됐을 때 PING이 사실상 그 재전송
+            // 역할을 한다 — 여기서 걸러 버리면 그 복구 경로가 통째로 막힌다.
             lock.lock()
             let existing = udpPeers.first(where: { $0.value == from })?.key
             let id = existing ?? UDPPeerID()
             udpPeers[id] = from
             lock.unlock()
-            onUdpHello?(id, parsed.rest)
+            if parsed.type == .hello { onUdpHello?(id, parsed.rest) }
+            else { onUdpPing?(id, parsed.rest) }
 
         case .video:
             // 알려진 피어에서 온 것만 받는다. **여기서 새 피어를 만들지 않는다** — 그러면
@@ -348,6 +356,11 @@ nonisolated final class LanServer: @unchecked Sendable {
             lock.unlock()
             guard let id else { return }
             onUdpVideo?(id, parsed.rest)
+
+        // Mac → Android 전용. Mac이 받을 일이 없다(Android가 자기 앞으로 보낼 이유가 없다) —
+        // 와도 그냥 버린다.
+        case .pong:
+            break
         }
     }
 }

@@ -158,6 +158,17 @@ enum PairEv: Equatable, Sendable {
     /// 펀칭 창이 끝나는 것도 이 사건이다 — 별도 사건을 두면 같은 뜻의 타이머가 둘이 되고,
     /// 그 둘이 어긋나는 게 정확히 이 기계가 없애려던 종류의 결함이다.
     case deadlineElapsed
+    /// TCP/UDP 세션이 실제로 섰다(`SessionManager`가 `sessionLive`/`pathSwapped`를 처리했다) —
+    /// **펀칭 창을 더 붙들고 있을 이유가 사라졌다.**
+    ///
+    /// `.punching`엔 13초짜리 마감이 있다(양쪽 펀치 타임아웃 + 여유). 그 여유는 "펀칭이 아직
+    /// 도는 중일 수 있다"는 가정에서 나온 것인데, 세션이 이미 섰다는 건 그 가정이 더는
+    /// 맞지 않는다는 뜻이다 — 이겼는데 창이 닫히기를 기다리는 셈이다. 이 사건은 그 관찰을
+    /// 그대로 기계에 실어, 마감이 아니라 **실제로 벌어진 일**로 라운드를 끝낸다.
+    ///
+    /// `.punching`이 아닌 단계에서 오면 조용히 버린다 — 이 라운드와 무관한 세션(다른 기기의
+    /// 재개, 낡은 보고)이 떴을 뿐이다.
+    case roundFinished
     case failed(String)
 }
 
@@ -320,6 +331,16 @@ func reduce(_ s: PairState, _ ev: PairEv) -> PairStep {
             return goto(s, .failed("\(s.phase) 단계 응답 없음"), [.disconnect])
         default:
             return PairStep(state: s)   // 마감이 없는 단계의 낡은 타이머
+        }
+
+    case .roundFinished:
+        switch s.phase {
+        // 이 창을 붙드는 이유가 사라졌다 — `deadlineElapsed`의 `.punching` 갈래와
+        // 결과가 같아야 한다(둘 다 "펀칭이 끝났다"는 같은 사실을 다른 경로로 안 것뿐이다).
+        case .punching:
+            return goto(s, .done, [.disconnect])
+        default:
+            return PairStep(state: s, fx: [.log("라운드와 무관한 세션 확립 — 무시")])
         }
 
     case .linkLost:

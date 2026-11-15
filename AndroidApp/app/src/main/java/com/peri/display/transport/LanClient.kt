@@ -34,6 +34,8 @@ class LanClient(private val scope: CoroutineScope) : Bearer {
     override var onConnected: (() -> Unit)? = null
     override var onDisconnected: ((Throwable?) -> Unit)? = null
     var onVideoPacket: ((MiniRtpPacket) -> Unit)? = null  // UDP 영상 (Mini-RTP)
+    /** UDP PING에 대한 Mac의 답 — 세션 레이어가 경로 생사를 판정하는 유일한 근거. */
+    var onUdpPong: ((nonce: ByteArray, body: ByteArray) -> Unit)? = null
 
     @Volatile private var socket: Socket? = null
     @Volatile private var output: OutputStream? = null
@@ -55,9 +57,13 @@ class LanClient(private val scope: CoroutineScope) : Bearer {
 
     /**
      * ICE 프로브 후킹. true를 돌려주면 그 데이터그램은 소비된 것으로 보고 영상 파서로 넘기지 않는다.
-     * MirrorController가 IceAgent에 연결한다.
+     * [PathNegotiator]가 IceAgent에 연결한다.
+     *
+     * 버퍼와 **유효 길이**를 함께 넘긴다 — 수신 버퍼는 재사용되므로 `data.size`는 이 패킷의
+     * 길이가 아니다. 길이를 안 주면 호출부가 매번 잘라 넘겨야 하고, 그게 곧 데이터그램마다
+     * 배열 하나다. 훅은 이 배열을 **붙들지 않는다**(그 자리에서 판정하고 끝난다).
      */
-    var onUdpProbe: ((ByteArray, Ipv4Endpoint) -> Boolean)? = null
+    var onUdpProbe: ((data: ByteArray, length: Int, from: Ipv4Endpoint) -> Boolean)? = null
 
     /**
      * 영상·펀칭·STUN이 **공유하는 단일 UDP 소켓**.
@@ -131,19 +137,32 @@ class LanClient(private val scope: CoroutineScope) : Bearer {
                     return@launch
                 }
                 if (!isActive) { Log.i(TAG, "udp recv 루프 종료(취소)"); return@launch }
-                val data = pkt.data.copyOf(pkt.length)
                 val from = Ipv4Endpoint(pkt.address?.hostAddress ?: "", pkt.port)
+
+                // ★ 여기서 데이터그램을 **복사하지 않는다.** 예전엔 `pkt.data.copyOf(length)`로
+                // 잘라 넘겼는데, 그 조각은 프로브 판정에도 영상 파싱에도 쓰이고 버려졌다 —
+                // 파서가 정말로 붙들어야 하는 건 청크뿐이고 그건 파서가 직접 뜬다.
+                // 초당 1000장이 넘는 경로라 이 한 번이 그대로 GC 압력이 된다.
 
                 // ICE 프로브를 먼저 본다 — 프로브 타입(2·3)은 UdpType(0·1)에 없어
                 // 영상 파서가 어차피 null을 준다.
-                if (onUdpProbe?.invoke(data, from) == true) continue
+                if (onUdpProbe?.invoke(pkt.data, pkt.length, from) == true) continue
+
+                // PONG은 영상 파서가 아니라 여기서 먼저 갈라낸다 — 파서가 타입 불일치로
+                // null을 주면 "UDP parse null" 경고가 매 PONG마다 찍혀 로그가 오염된다.
+                if (UdpType.from(pkt.data.getOrNull(0)?.toInt()?.and(0xFF) ?: -1) == UdpType.PONG) {
+                    WireFormat.parseUdpPong(pkt.data, pkt.length)?.let { (nonce, body) ->
+                        onUdpPong?.invoke(nonce, body)
+                    }
+                    continue
+                }
 
                 count++
                 if (count <= 3 || count % 120 == 0) {
                     Log.i(TAG, "UDP recv #$count ${pkt.length}B from $from")
                 }
-                val parsed = WireFormat.parseUdpVideo(data)
-                if (parsed == null) Log.w(TAG, "UDP parse null (${data.size}B, type=${data.getOrNull(0)})")
+                val parsed = WireFormat.parseUdpVideo(pkt.data, pkt.length)
+                if (parsed == null) Log.w(TAG, "UDP parse null (${pkt.length}B, type=${pkt.data.getOrNull(0)})")
                 else onVideoPacket?.invoke(parsed)
             }
         }

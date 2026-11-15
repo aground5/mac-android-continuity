@@ -40,8 +40,15 @@ object ScreenShare {
 
     // ── 바깥으로 나가는 사실들 (MirrorController가 건다) ────────────────────
 
-    /** 완성된 AU 하나. **인코더 스레드에서** 불린다. */
-    @Volatile var onFrame: ((bitstream: ByteArray, keyframe: Boolean, ptsMs: Long) -> Unit)? = null
+    /**
+     * 완성된 AU 하나. **인코더 스레드에서** 불린다.
+     *
+     * `ltrSlot`은 이 프레임이 새겨진 장기 참조 슬롯(-1 = 앵커 아님). Mac이 이 프레임을
+     * 온전히 받았다고 알려 주면 그 슬롯이 손실 복구의 되돌아갈 자리가 된다.
+     */
+    @Volatile var onFrame: ((
+        bitstream: ByteArray, keyframe: Boolean, ptsMs: Long, ltrSlot: Int,
+    ) -> Unit)? = null
     /**
      * 보낼 영상의 제원이 정해졌다 — Mac이 이게 있어야 디코더를 세운다.
      *
@@ -137,6 +144,30 @@ object ScreenShare {
         if (wasSharing && notifyPeer) onStopped?.invoke(reason)
     }
 
+    /**
+     * Mac이 갱신을 청했다 — **확장 경로의 거울상이다.**
+     *
+     * 거기서는 우리가 청하고 Mac이 냈다(`KeyframeRequest{need}` → `forceLTRRefresh` 또는
+     * `requestKeyframe`). 여기서는 방향만 반대이고 판단 규칙은 같다:
+     *
+     *  · 참조가 살아 있다(`refresh`) → 확인된 앵커를 가리키는 작은 프레임으로 충분하다.
+     *  · 참조가 아예 없다(`idr`)     → SPS/PPS가 실린 IDR이라야 한다.
+     *
+     * 앵커가 아직 없으면 `refresh`도 IDR로 물러난다. 없는 참조를 가리키면 화면이 조용히
+     * 깨지는데, 받는 쪽은 그 사실조차 모른다.
+     */
+    fun requestRefresh(needIdr: Boolean, why: String) {
+        val enc = encoder ?: run {
+            Log.i(TAG, "갱신 요청 생략($why) — 인코더 없음")
+            return
+        }
+        if (!needIdr && enc.refreshFromLtr(why)) return
+        enc.requestKeyframe(if (needIdr) why else "$why (앵커 없음)")
+    }
+
+    /** Mac이 이 슬롯의 앵커 프레임을 온전히 받았다. */
+    fun confirmLtr(slot: Int) { encoder?.confirmLtr(slot) }
+
     // ── Activity가 부르는 것 ───────────────────────────────────────────────
 
     /**
@@ -192,7 +223,7 @@ object ScreenShare {
         val enc = ScreenEncoder(
             width = spec.width, height = spec.height, fps = spec.fps,
             bitrateKbps = spec.kbps, preferHevc = true,
-            onFrame = { au, key, pts -> onFrame?.invoke(au, key, pts) },
+            onFrame = { au, key, pts, slot -> onFrame?.invoke(au, key, pts, slot) },
             onError = { why -> stop(why) },
         )
         val surface = enc.start()

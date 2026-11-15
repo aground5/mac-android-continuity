@@ -436,6 +436,16 @@ final class Session: ObservableObject, Identifiable {
     /// 이 UDP 피어가 지금 이 세션의 것인가 — 매니저가 수신 영상을 디먹스하는 근거.
     nonisolated func ownsUdpPeer(_ id: LanServer.UDPPeerID) -> Bool { udpPeerBox.value == id }
 
+    /// PING에 대한 답. 지금 세대 id를 봉인해 돌려보낸다 — Android는 그걸 열어 자기 세대와
+    /// 대조해 "이 PONG이 지금 세대의 것인가"까지 확인한다(늦게 온 지난 세대의 PONG 방지).
+    ///
+    /// 매니저(`onUdpPing`)가 [linkUdp]로 피어를 이미 재등록한 **뒤에** 부른다 — 그래야
+    /// 망 전환으로 주소가 바뀐 첫 PING에도 답이 새 주소로 나간다.
+    nonisolated func replyPong(to peerID: LanServer.UDPPeerID) {
+        guard let d = datagramBox.value, let sealed = try? d.keys.sender.seal(d.id) else { return }
+        server.sendVideo(WireFormat.pongDatagram(nonce: sealed.nonce, body: sealed.body), to: peerID)
+    }
+
     /// 손실 허용 경로로 온 영상 조각 하나. **LAN 큐에서 동기로** 불린다.
     ///
     /// 조각이 다 모여야 봉인이 풀리므로 대부분의 호출은 아무 일도 하지 않고 돌아간다 —
@@ -903,6 +913,14 @@ final class Session: ObservableObject, Identifiable {
 /// LanServer 1개를 소유하고 클라이언트별 Session을 생성·라우팅한다. 여러 Android를 동시 송출.
 @MainActor
 final class SessionManager: ObservableObject {
+
+    /// 세대 id의 앞 4바이트 — 로그에서 세대를 눈으로 대조하는 키.
+    ///
+    /// Android도 같은 자리(`id.take(4)`)를 같은 형식으로 찍는다. 두 로그의 이 값이 다르면
+    /// 세대가 갈린 것이고, 같은데 HELLO가 안 맞으면 봉인 쪽 문제다.
+    nonisolated static func hex(_ d: Data) -> String {
+        d.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
     @Published private(set) var isRunning = false
     @Published private(set) var statusMessage = "준비됨"
     @Published private(set) var localIP = "—"
@@ -970,6 +988,11 @@ final class SessionManager: ObservableObject {
     /// 따로 들고 있다. 알려 주지 않으면 이미 정리된 세션을 8초 뒤 한 번 더 "정리"한다.
     /// AppCore가 `aoa.forget(_:)`으로 배선한다.
     var onSessionReleased: ((Session) -> Void)?
+
+    /// 제어 채널이 실제로 살아났다(`sessionLive`/`pathSwapped`가 `startLiveness`를 낸 바로 그
+    /// 순간) — BLE 페어링 라운드가 이 신호를 기다리며 창을 붙들고 있었다면 이제 끝내도 된다.
+    /// AppCore가 `pairing.finishRound()`로 배선한다.
+    var onSessionEstablished: (() -> Void)?
 
     // MARK: - 로그 형식
     //
@@ -1085,6 +1108,7 @@ final class SessionManager: ObservableObject {
 
         case .startLiveness:
             dev.session?.setLivenessEnabled(true)
+            onSessionEstablished?()
 
         case .stopLiveness:
             dev.session?.setLivenessEnabled(false)
@@ -1322,10 +1346,36 @@ final class SessionManager: ObservableObject {
             for s in self.router.all()
             where s.acceptsHello(channel: h.channel, nonce: h.nonce, body: h.body) {
                 s.linkUdp(peerID)
-                log.info("udp HELLO → 세대 매칭, 영상 피어 연결")
+                log.info("udp HELLO → 세대 \(Self.hex(h.channel)) 매칭, 영상 피어 연결")
                 return
             }
-            log.error("udp HELLO: 열려 있는 세대 중 맞는 것이 없음")
+            // ★ **양쪽 id를 다 찍는다.** 이 줄이 안 그러던 때가 있었는데, 그러면 "안 맞는다"
+            // 까지만 알고 무엇이 안 맞는지는 알 수 없다 — 세대가 갈린 것인지(둘 다 열려 있는데
+            // 번호가 다르다), 아예 안 열린 것인지(목록이 비었다), 봉인이 안 풀린 것인지
+            // (번호는 같은데 안 맞는다)가 전부 같은 한 줄로 보였다. 셋의 원인은 다 다르다.
+            let open = self.router.all().compactMap { $0.datagramChannelID }.map(Self.hex)
+            log.error("""
+                udp HELLO: 맞는 세대 없음 — 들어온 id=\(Self.hex(h.channel)), \
+                열려 있는 세대=[\(open.joined(separator: ", "))]
+                """)
+        }
+        // UDP PING → HELLO와 같은 매칭(피어 재등록) 뒤에 PONG으로 답한다.
+        //
+        // Android의 "영상이 안 온다" 감시가 재협상을 청하기 전에 마지막으로 두드려 보는
+        // 자리다. 맞는 세대가 없으면(세대가 갈렸거나 이미 닫혔다) 조용히 무시한다 — PONG이
+        // 안 오는 것 자체가 Android에게는 "재협상이 필요하다"는 신호다.
+        server.onUdpPing = { [weak self] peerID, rest in
+            guard let self else { return }
+            guard let h = WireFormat.parseUdpHello(rest) else {
+                log.error("udp PING: 형식 오류 (\(rest.count)B)")
+                return
+            }
+            for s in self.router.all()
+            where s.acceptsHello(channel: h.channel, nonce: h.nonce, body: h.body) {
+                s.linkUdp(peerID)
+                s.replyPong(to: peerID)
+                return
+            }
         }
         // UDP 영상(화면 공유) → 그 피어를 가진 세션. HELLO가 이미 주소↔세션을 묶어 놨으므로
         // 여기선 조회 한 번이면 된다 — 프레임마다 시도복호화를 돌릴 이유가 없다.

@@ -245,13 +245,24 @@ sealed interface Fx {
     data object StopKeepalive : Fx
 
     /**
-     * 디코더가 없으면 만든다 — **세션이 서는 모든 문에서 나온다.**
+     * 앱들에게 "말할 채널이 생겼다"를 알린다 — **세션이 서는 모든 문에서 나온다.**
+     *
+     * 무엇을 세울지는 앱마다 다르다: 확장은 디코더를, 공유는 재동의 대기를, 알림은 권한
+     * 재확인을 한다. 기계는 그 어휘를 모르고 알 필요도 없다(원칙 1).
      *
      * 예전엔 디코더 생성이 기계 밖(`startPunch`/`connect`/`reconnectNow`)에 흩어져 있었고,
      * 그 사이에 `DropSession`이 끼면 아무도 다시 만들지 않았다. 영상은 도착하는데 그릴 곳이
      * 없어 검은 화면이 됐다. 세션 확립·무손실 재개 둘 다 여기를 지난다.
      */
-    data object EnsureDecoder : Fx
+    data object AttachApps : Fx
+
+    /**
+     * 새 세션이 섰다 — 영상 디코더를 다시 세운다.
+     *
+     * [AttachApps]와 갈라 둔 이유: 경로만 갈리는 무손실 전환에서도 앱은 다시 붙지만
+     * 디코더는 **그대로 두어야 한다**. 둘을 한 효과로 묶으면 그 구분이 사라진다.
+     */
+    data object ResetDecoder : Fx
     data object CloseTransport : Fx
     data object SendBye : Fx
 
@@ -369,7 +380,16 @@ fun reduce(s: MirrorState, ev: Ev): Step = when (ev) {
         if (s.path is Path.Live) {
             Step(
                 s.copy(sess = Sess.Live(ev.peer), retries = 0),
-                listOf(Fx.CancelHandshakeWatchdog, Fx.EnsureDecoder, Fx.StartKeepalive),
+                // ★ 디코더를 다시 세우는 자리는 **여기 하나뿐이다.**
+                //
+                // 예전엔 전화를 걸기 시작할 때(`StartConnect`) 죽였는데, 그러면 그 연결이
+                // 실패했을 때 멀쩡하던 디코더까지 같이 잃는다. 실기기에서 USB 전환이
+                // 8초 뒤 핸드셰이크 실패로 끝났고, 그 8초 동안 화면은 이미 죽어 있었다.
+                //
+                // 새 세션 = 새 키·새 프레임 번호·새 타임스탬프 기준점이라 여기서는 실제로
+                // 다시 세워야 한다. 반대로 경로만 갈리는 무손실 전환(`PathSwapped`)은
+                // 세션이 그대로이므로 이 효과가 나가지 않는다 — 그게 이 자리의 요점이다.
+                listOf(Fx.CancelHandshakeWatchdog, Fx.ResetDecoder, Fx.AttachApps, Fx.StartKeepalive),
             )
         } else {
             // ★ 경로가 이미 죽은 뒤에 도착한 ServerHello. read 루프가 프레임을 넘긴 직후
@@ -468,7 +488,7 @@ fun reduce(s: MirrorState, ev: Ev): Step = when (ev) {
     // Mac의 생존감지(6s)가 방금 살려낸 세션을 도로 죽인다(실기기에서 겪음).
     is Ev.PathSwapped ->
         if (s.sess is Sess.Live) {
-            Step(s.copy(path = Path.Live(Via.LAN)), listOf(Fx.EnsureDecoder, Fx.StartKeepalive))
+            Step(s.copy(path = Path.Live(Via.LAN)), listOf(Fx.AttachApps, Fx.StartKeepalive))
         } else {
             // ★ 재개할 세션이 없는데 교체 성공 보고가 왔다 = 워치독(30s)이 먼저 터져 라운드를
             // 접은 뒤 펀칭 스레드가 뒤늦게 성공한 경합이다. 그 소켓은 Mac 쪽에서 RESUME으로
